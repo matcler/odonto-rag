@@ -1,8 +1,2 @@
-import subprocess
-
-def gcloud_token() -> str:
-    return subprocess.check_output(
-        ["gcloud", "auth", "print-access-token"],
-        text=True
-    ).strip()
-
+# Backward-compatible shim (temporary during refactor)
+from odonto_rag.ingest.gcloud_auth import *  # noqa: F401,F403

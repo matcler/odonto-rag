@@ -1,8 +1,2 @@
-# ----------------- Google token -----------------
-def gcloud_token() -> str:
-    tok = os.popen("gcloud auth print-access-token").read().strip()
-    if not tok:
-        raise RuntimeError("No gcloud access token. Run: gcloud auth login")
-    return tok
-
-
+# Backward-compatible shim (temporary during refactor)
+from odonto_rag.ingest.utils_gcloud import *  # noqa: F401,F403
