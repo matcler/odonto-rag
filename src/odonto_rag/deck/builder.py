@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+from importlib import resources
+from pathlib import Path
+
+DEFAULT_TEMPLATE_NAME = "chairside_test_template.pptx"
+
+def get_template_path(name: str = DEFAULT_TEMPLATE_NAME) -> str:
+    """
+    Returns a filesystem path to a bundled PPTX template.
+    Works in source tree and when installed as a package.
+    """
+    with resources.as_file(resources.files("odonto_rag.deck.templates") / name) as p:
+        return str(Path(p))
+
 import argparse
 import json
 import math
@@ -498,7 +511,7 @@ def build_pptx(
     if template_path and not os.path.exists(template_path):
         raise SlideSpecError(f"Template not found: {template_path}")
 
-    prs = Presentation(template_path) if template_path else Presentation()
+    prs = Presentation(template_path or get_template_path())
 
     use_template_fonts = bool(template_path)
     use_template_colors = bool(template_path)
