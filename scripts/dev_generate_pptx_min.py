@@ -110,3 +110,11 @@ if __name__ == "__main__":
     QUERY = "dental adhesive systems etch-and-rinse self-etch universal clinical performance meta-analysis"
     make_pptx(TITLE, QUERY, out_path="odonto_adhesives.pptx")
 
+
+def main():
+    # Minimal wrapper to keep CLI behavior stable during refactor
+    # The script logic should already run under __main__ below.
+    pass
+
+if __name__ == "__main__":
+    main()
