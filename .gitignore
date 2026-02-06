@@ -9,9 +9,15 @@ venv/
 # macOS
 .DS_Store
 
-# Env
-.env
-
 # Outputs / artifacts
 out/
 outputs/
+
+.env
+.env.*
+*.sqlite
+*.sqlite3
+.qdrant*
+data/
+qdrant/
+storage/
