@@ -1,1 +1,3 @@
 python-pptx
+google-cloud-documentai
+gcsfs
