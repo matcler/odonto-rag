@@ -67,7 +67,10 @@ def _text_from_anchor(anchor, full_text: str) -> str:
     parts: list[str] = []
     for segment in anchor.text_segments:
         start = int(segment.start_index or 0)
-        end = int(segment.end_index or 0)
+        if segment.end_index is None:
+            end = len(full_text)
+        else:
+            end = int(segment.end_index or 0)
         if end <= start:
             continue
         parts.append(full_text[start:end])
@@ -101,6 +104,43 @@ def _table_to_rows(table, full_text: str) -> list[list[str]]:
             row_cells.append(_text_from_anchor(cell.layout.text_anchor, full_text))
         rows.append(row_cells)
     return rows
+
+
+def _layout_table_to_rows(table_block: dict) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for row in table_block.get("header_rows", []) + table_block.get("body_rows", []):
+        row_cells = []
+        for cell in row.get("cells", []):
+            parts = []
+            for block in cell.get("blocks", []):
+                text = block.get("text_block", {}).get("text", "")
+                if text:
+                    parts.append(text)
+            row_cells.append(" ".join(parts).strip())
+        rows.append(row_cells)
+    return rows
+
+
+def _layout_page_span(block: dict) -> dict[str, int] | None:
+    span = block.get("page_span")
+    if span and "page_start" in span and "page_end" in span:
+        return {"page_start": span["page_start"], "page_end": span["page_end"]}
+    table = block.get("table_block", {})
+    for row in table.get("header_rows", []) + table.get("body_rows", []):
+        for cell in row.get("cells", []):
+            for child in cell.get("blocks", []):
+                child_span = child.get("page_span")
+                if child_span and "page_start" in child_span and "page_end" in child_span:
+                    return {"page_start": child_span["page_start"], "page_end": child_span["page_end"]}
+    return None
+
+
+def _iter_layout_blocks(blocks: list[dict]) -> Iterable[dict]:
+    for block in blocks:
+        yield block
+        child_blocks = block.get("text_block", {}).get("blocks", [])
+        if child_blocks:
+            yield from _iter_layout_blocks(child_blocks)
 
 
 def main() -> None:
@@ -160,6 +200,9 @@ def main() -> None:
         )
 
         document = result.document
+        print("pdf_bytes_len:", len(pdf_bytes))
+        print("pages_count:", len(document.pages))
+        print("text_len:", len(document.text or ""))
         raw_dict = MessageToDict(document._pb, preserving_proto_field_name=True)
         _gsutil_write_text(raw_output_uri, json.dumps(raw_dict, ensure_ascii=False, indent=2))
 
@@ -167,37 +210,72 @@ def main() -> None:
         now = datetime.utcnow().isoformat() + "Z"
         full_text = document.text or ""
 
-        for i, page in enumerate(document.pages, start=1):
-            text = _page_text(page, full_text)
-            if text:
-                items.append(json.dumps({
-                    "item_id": str(uuid.uuid4()),
-                    "doc_id": args.doc_id,
-                    "version_id": args.version_id,
-                    "item_type": "page",
-                    "text": text,
-                    "locator": {"page_start": i, "page_end": i},
-                    "meta": {"ingested_at": now},
-                }, ensure_ascii=False))
+        if document.pages:
+            for i, page in enumerate(document.pages, start=1):
+                text = _page_text(page, full_text)
+                if text:
+                    items.append(json.dumps({
+                        "item_id": str(uuid.uuid4()),
+                        "doc_id": args.doc_id,
+                        "version_id": args.version_id,
+                        "item_type": "page",
+                        "text": text,
+                        "locator": {"page_start": i, "page_end": i},
+                        "meta": {"ingested_at": now},
+                    }, ensure_ascii=False))
 
-            for table in page.tables:
-                aid = str(uuid.uuid4())
-                table_uri = gcs_uri(bucket, layout.asset_table(aid))
-                _gsutil_write_text(
-                    table_uri,
-                    json.dumps({
-                        "rows": _table_to_rows(table, full_text),
-                        "page": i,
-                        "bbox": _bounding_poly_to_list(table.layout.bounding_poly),
-                    }, ensure_ascii=False),
-                )
-                assets.append(json.dumps({
-                    "asset_id": aid,
-                    "asset_type": "table",
-                    "files": {"table_uri": table_uri},
-                    "locator": {"page_start": i, "page_end": i},
-                    "meta": {"ingested_at": now},
-                }, ensure_ascii=False))
+                for table in page.tables:
+                    aid = str(uuid.uuid4())
+                    table_uri = gcs_uri(bucket, layout.asset_table(aid))
+                    _gsutil_write_text(
+                        table_uri,
+                        json.dumps({
+                            "rows": _table_to_rows(table, full_text),
+                            "page": i,
+                            "bbox": _bounding_poly_to_list(table.layout.bounding_poly),
+                        }, ensure_ascii=False),
+                    )
+                    assets.append(json.dumps({
+                        "asset_id": aid,
+                        "asset_type": "table",
+                        "files": {"table_uri": table_uri},
+                        "locator": {"page_start": i, "page_end": i},
+                        "meta": {"ingested_at": now},
+                    }, ensure_ascii=False))
+        else:
+            layout_blocks = raw_dict.get("document_layout", {}).get("blocks", [])
+            for block in _iter_layout_blocks(layout_blocks):
+                text_block = block.get("text_block", {})
+                text = text_block.get("text", "")
+                if text:
+                    locator = _layout_page_span(block) or {}
+                    items.append(json.dumps({
+                        "item_id": str(uuid.uuid4()),
+                        "doc_id": args.doc_id,
+                        "version_id": args.version_id,
+                        "item_type": text_block.get("type_", "block"),
+                        "text": text,
+                        "locator": locator,
+                        "meta": {"ingested_at": now},
+                    }, ensure_ascii=False))
+
+                table_block = block.get("table_block")
+                if table_block:
+                    aid = str(uuid.uuid4())
+                    table_uri = gcs_uri(bucket, layout.asset_table(aid))
+                    table_rows = _layout_table_to_rows(table_block)
+                    _gsutil_write_text(
+                        table_uri,
+                        json.dumps({"rows": table_rows}, ensure_ascii=False),
+                    )
+                    locator = _layout_page_span(block) or {}
+                    assets.append(json.dumps({
+                        "asset_id": aid,
+                        "asset_type": "table",
+                        "files": {"table_uri": table_uri},
+                        "locator": locator,
+                        "meta": {"ingested_at": now},
+                    }, ensure_ascii=False))
 
         _gsutil_write_text(items_uri, "\n".join(items) + "\n")
         _gsutil_write_text(assets_uri, "\n".join(assets) + "\n")
