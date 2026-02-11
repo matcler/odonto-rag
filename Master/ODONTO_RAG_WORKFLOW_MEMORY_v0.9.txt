@@ -356,3 +356,14 @@ Addendum — 2026-02-11
   - VERTEX_EMBED_LOCATION (defaults to GCP_LOCATION/LOCATION)
   - VERTEX_LLM_LOCATION (defaults to GCP_LOCATION/LOCATION)
 - Recommended dev smoke-test LLM model: gemini-2.0-flash-001 in us-central1 (or any available Gemini model with -001/-002 suffix).
+
+Addendum — 2026-02-11 (STEP 8 MVP)
+----------------------------------
+- Added new POST endpoint `/rag/outline` in `src/odonto_rag/api/rag_app.py`.
+- Request model: `RagOutlineRequest` with `query/topic`, `top_k` (default 25), optional `doc_id`, required `version`, `max_sections` (default 10), and `include_retrieved` (default false).
+- Retrieval path reuses existing `retrieve_items(query, top_k, doc_id, version)` and builds `[S#]` context snippets (about 500 chars each).
+- Added lightweight dedup before context assembly: repeated `header` items are collapsed by case-insensitive identical text.
+- LLM prompt requires strict JSON-only outline output; parse failures return HTTP 500 including the first 200 chars of model output.
+- Response model: `RagOutlineResponse` with `title`, structured `sections`, resolved `citations` (`RagCitation` mapped from `S#` tokens to item/page ranges), and optional `retrieved` payload.
+- Env vars reused (no new env required): `GCP_PROJECT`/`PROJECT_ID`, `VERTEX_LLM_LOCATION` (or `GCP_LOCATION`/`LOCATION` fallback), `VERTEX_LLM_MODEL`, plus retrieval-side vars (`VERTEX_EMBED_LOCATION`, `VERTEX_EMBED_MODEL`, `QDRANT_URL`, `QDRANT_API_KEY`).
+- outline parser now strips ```json fences

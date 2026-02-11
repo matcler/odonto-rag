@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import re
@@ -79,6 +80,7 @@ class RetrievedItem(BaseModel):
 
 
 DEFAULT_ANSWER_SNIPPET_LEN = 800
+DEFAULT_OUTLINE_SNIPPET_LEN = 500
 
 
 class RagAnswerRequest(BaseModel):
@@ -98,6 +100,31 @@ class RagCitation(BaseModel):
 
 class RagAnswerResponse(BaseModel):
     answer: str
+    citations: List[RagCitation]
+    retrieved: Optional[List[RetrievedItem]] = None
+
+
+class RagOutlineRequest(BaseModel):
+    query: Optional[str] = Field(None, min_length=1)
+    topic: Optional[str] = Field(None, min_length=1)
+    top_k: int = Field(25, ge=1, le=50)
+    doc_id: Optional[str] = None
+    version: str = Field(..., min_length=1)
+    max_sections: int = Field(10, ge=1, le=20)
+    include_retrieved: bool = False
+
+
+class RagOutlineSection(BaseModel):
+    id: int
+    heading: str
+    learning_objectives: List[str]
+    key_points: List[str]
+    citations: List[str]
+
+
+class RagOutlineResponse(BaseModel):
+    title: str
+    sections: List[RagOutlineSection]
     citations: List[RagCitation]
     retrieved: Optional[List[RetrievedItem]] = None
 
@@ -219,6 +246,19 @@ def _build_context(items: List[RetrievedItem], snippet_len: int) -> str:
     return "\n".join(lines).strip()
 
 
+def _dedupe_header_items(items: List[RetrievedItem]) -> List[RetrievedItem]:
+    deduped: List[RetrievedItem] = []
+    seen_headers: set[str] = set()
+    for item in items:
+        if (item.item_type or "").lower() == "header":
+            norm = " ".join(item.text.strip().lower().split())
+            if norm in seen_headers:
+                continue
+            seen_headers.add(norm)
+        deduped.append(item)
+    return deduped
+
+
 def _make_answer_prompt(query: str, context: str) -> str:
     return (
         "You are a didactic assistant for dental materials.\n"
@@ -234,6 +274,21 @@ def _make_answer_prompt(query: str, context: str) -> str:
     )
 
 
+def _make_outline_prompt(query: str, context: str, max_sections: int) -> str:
+    return (
+        "You are a didactic assistant for dental materials.\n"
+        "Build a study outline using ONLY the provided context.\n"
+        "Return STRICT JSON only (no markdown, no code fences, no extra text).\n"
+        "Use this exact schema:\n"
+        '{ "title": str, "sections": [ { "id": int, "heading": str, "learning_objectives": [str], '
+        '"key_points": [str], "citations": ["S1","S2"] } ] }\n'
+        f"Limit sections to at most {max_sections}.\n"
+        "Citations must use only S# tokens from context.\n\n"
+        f"Query:\n{query}\n\n"
+        f"Context:\n{context}\n"
+    )
+
+
 def _extract_citation_tokens(answer: str) -> List[int]:
     seen = set()
     ordered: List[int] = []
@@ -243,6 +298,37 @@ def _extract_citation_tokens(answer: str) -> List[int]:
             seen.add(idx)
             ordered.append(idx)
     return ordered
+
+
+def _extract_outline_citation_tokens(sections: List[RagOutlineSection]) -> List[int]:
+    seen = set()
+    ordered: List[int] = []
+    for section in sections:
+        for raw in section.citations:
+            match = re.fullmatch(r"\[?S(\d+)\]?", str(raw).strip())
+            if not match:
+                continue
+            idx = int(match.group(1))
+            if idx not in seen:
+                seen.add(idx)
+                ordered.append(idx)
+    return ordered
+
+
+def _strip_json_fences(s: str) -> str:
+    t = s.strip()
+    if t.startswith("```"):
+        if t.startswith("```json"):
+            t = t[len("```json") :].strip()
+        else:
+            t = t[len("```") :].strip()
+        if t.endswith("```"):
+            t = t[: -len("```")].strip()
+    first = t.find("{")
+    last = t.rfind("}")
+    if first == -1 or last == -1 or last < first:
+        return ""
+    return t[first : last + 1].strip()
 
 
 @app.post("/rag/query", response_model=RagResponse)
@@ -341,3 +427,93 @@ def rag_answer(req: RagAnswerRequest) -> RagAnswerResponse:
             )
 
     return RagAnswerResponse(answer=answer, citations=citations, retrieved=items)
+
+
+@app.post("/rag/outline", response_model=RagOutlineResponse)
+def rag_outline(req: RagOutlineRequest) -> RagOutlineResponse:
+    project = os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID") or ""
+    llm_location = os.environ.get("VERTEX_LLM_LOCATION") or os.environ.get("GCP_LOCATION") or os.environ.get("LOCATION") or ""
+    llm_location = _normalize_location(llm_location, name="VERTEX_LLM_LOCATION")
+    model = os.environ.get("VERTEX_LLM_MODEL") or ""
+    if not project or not llm_location or not model:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing GCP_PROJECT/PROJECT_ID or VERTEX_LLM_LOCATION/GCP_LOCATION/LOCATION or VERTEX_LLM_MODEL",
+        )
+
+    query_text = (req.query or req.topic or "").strip()
+    if not query_text:
+        raise HTTPException(status_code=400, detail="Missing query/topic")
+
+    items = retrieve_items(query_text, req.top_k, req.doc_id, req.version)
+    context_items = _dedupe_header_items(items)
+    context = _build_context(context_items, snippet_len=DEFAULT_OUTLINE_SNIPPET_LEN)
+    prompt = _make_outline_prompt(query_text, context, req.max_sections)
+
+    try:
+        raw_output = llm_generate_text(
+            prompt,
+            temperature=0.2,
+            max_output_tokens=2200,
+            model=model,
+            project=project,
+            location=llm_location,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM failed: {e}") from e
+
+    try:
+        cleaned = _strip_json_fences(raw_output)
+        if not cleaned:
+            raise ValueError("missing JSON object braces")
+        parsed = json.loads(cleaned)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Outline JSON parse failed: {e}; output_head={raw_output[:200]}",
+        ) from e
+
+    title = str(parsed.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=500, detail="Outline JSON invalid: missing title")
+
+    sections_raw = parsed.get("sections")
+    if not isinstance(sections_raw, list):
+        raise HTTPException(status_code=500, detail="Outline JSON invalid: sections must be a list")
+
+    sections: List[RagOutlineSection] = []
+    for sec in sections_raw[: req.max_sections]:
+        if not isinstance(sec, dict):
+            continue
+        sections.append(
+            RagOutlineSection(
+                id=int(sec.get("id", 0)),
+                heading=str(sec.get("heading") or "").strip(),
+                learning_objectives=[str(x).strip() for x in sec.get("learning_objectives", []) if str(x).strip()],
+                key_points=[str(x).strip() for x in sec.get("key_points", []) if str(x).strip()],
+                citations=[str(x).strip() for x in sec.get("citations", []) if str(x).strip()],
+            )
+        )
+
+    token_ids = _extract_outline_citation_tokens(sections)
+    citations: List[RagCitation] = []
+    for token_id in token_ids:
+        if 1 <= token_id <= len(context_items):
+            item = context_items[token_id - 1]
+            page_start, page_end = _page_range(item.locator)
+            citations.append(
+                RagCitation(
+                    ref_id=f"S{token_id}",
+                    item_id=item.item_id,
+                    page_start=page_start,
+                    page_end=page_end,
+                    score=item.score,
+                )
+            )
+
+    return RagOutlineResponse(
+        title=title,
+        sections=sections,
+        citations=citations,
+        retrieved=context_items if req.include_retrieved else None,
+    )
