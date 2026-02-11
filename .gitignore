@@ -18,6 +18,7 @@ outputs/
 *.sqlite
 *.sqlite3
 .qdrant*
+qdrant.tar.gz
 data/
 qdrant/
 storage/
