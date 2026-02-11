@@ -1,3 +1,4 @@
 python-pptx
 google-cloud-documentai
 gcsfs
+google-cloud-aiplatform
