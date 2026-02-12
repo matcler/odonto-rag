@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import re
@@ -9,10 +10,17 @@ from typing import Any, Dict, List, Optional
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+try:
+    from pydantic import model_validator
+except ImportError:  # pydantic v1 fallback
+    model_validator = None  # type: ignore[assignment]
+
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from odonto_rag.rag.providers.vertex import llm_generate_text
+
+logger = logging.getLogger(__name__)
 
 
 def _get_access_token() -> str:
@@ -126,6 +134,33 @@ class RagOutlineResponse(BaseModel):
     title: str
     sections: List[RagOutlineSection]
     citations: List[RagCitation]
+    retrieved: Optional[List[RetrievedItem]] = None
+
+
+class RagSlidesPlanRequest(BaseModel):
+    outline: Optional[Dict[str, Any]] = None
+    query: Optional[str] = Field(None, min_length=1)
+    top_k: int = Field(25, ge=1, le=50)
+    version: str = Field(..., min_length=1)
+    doc_id: Optional[str] = None
+    max_sections: Optional[int] = Field(None, ge=1, le=20)
+    slides_per_section: int = Field(2, ge=1, le=5)
+    max_slides: int = Field(20, ge=1, le=50)
+    include_retrieved: bool = False
+
+
+class RagSlidePlanItem(BaseModel):
+    slide_no: int
+    title: str
+    bullets: List[str]
+    speaker_notes: Optional[str] = None
+    citations: List[str]
+    sources: List[RagCitation]
+
+
+class RagSlidesPlanResponse(BaseModel):
+    slides: List[RagSlidePlanItem]
+    outline_used: Optional[RagOutlineResponse] = None
     retrieved: Optional[List[RetrievedItem]] = None
 
 
@@ -317,18 +352,86 @@ def _extract_outline_citation_tokens(sections: List[RagOutlineSection]) -> List[
 
 def _strip_json_fences(s: str) -> str:
     t = s.strip()
-    if t.startswith("```"):
-        if t.startswith("```json"):
-            t = t[len("```json") :].strip()
-        else:
-            t = t[len("```") :].strip()
-        if t.endswith("```"):
-            t = t[: -len("```")].strip()
+    if not t:
+        return ""
+    if t.startswith("\ufeff"):
+        t = t.lstrip("\ufeff").strip()
+    if "```" in t:
+        fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", t, re.DOTALL | re.IGNORECASE)
+        if fence_match:
+            t = fence_match.group(1).strip()
     first = t.find("{")
     last = t.rfind("}")
     if first == -1 or last == -1 or last < first:
         return ""
     return t[first : last + 1].strip()
+
+
+def _map_token_ids_to_citations(
+    token_ids: List[int], items: List[RetrievedItem]
+) -> List[RagCitation]:
+    citations: List[RagCitation] = []
+    for token_id in token_ids:
+        if 1 <= token_id <= len(items):
+            item = items[token_id - 1]
+            page_start, page_end = _page_range(item.locator)
+            citations.append(
+                RagCitation(
+                    ref_id=f"S{token_id}",
+                    item_id=item.item_id,
+                    page_start=page_start,
+                    page_end=page_end,
+                    score=item.score,
+                )
+            )
+    return citations
+
+
+def _map_ref_tokens_to_citations(
+    refs: List[str], citation_by_ref: Dict[str, RagCitation]
+) -> List[RagCitation]:
+    out: List[RagCitation] = []
+    seen: set[str] = set()
+    for raw in refs:
+        m = re.fullmatch(r"\[?S(\d+)\]?", str(raw).strip())
+        if not m:
+            continue
+        ref = f"S{int(m.group(1))}"
+        if ref in seen:
+            continue
+        c = citation_by_ref.get(ref)
+        if c:
+            seen.add(ref)
+            out.append(c)
+    return out
+
+
+def _dedupe_outline_sections(sections: List[RagOutlineSection]) -> List[RagOutlineSection]:
+    deduped: List[RagOutlineSection] = []
+    seen: set[str] = set()
+    for sec in sections:
+        norm = " ".join(sec.heading.strip().lower().split())
+        if norm and norm in seen:
+            continue
+        if norm:
+            seen.add(norm)
+        deduped.append(sec)
+    return deduped
+
+
+def _make_slides_plan_prompt(
+    outline_json: str, target_slides: int, max_slides: int
+) -> str:
+    return (
+        "You are planning didactic dental slides from an outline.\n"
+        "Return STRICT JSON only (no markdown, no code fences, no extra text).\n"
+        "Use this schema exactly:\n"
+        '{ "slides": [ { "slide_no": int, "title": str, "bullets": [str], "speaker_notes": str, "citations": ["S1","S2"] } ] }\n'
+        f"Generate around {target_slides} slides and never exceed {max_slides}.\n"
+        "Avoid duplicate slide titles/headings.\n"
+        "Use only citation tokens already present in the outline.\n\n"
+        f"Outline JSON:\n{outline_json}\n"
+    )
 
 
 @app.post("/rag/query", response_model=RagResponse)
@@ -411,20 +514,7 @@ def rag_answer(req: RagAnswerRequest) -> RagAnswerResponse:
         raise HTTPException(status_code=500, detail=f"LLM failed: {e}") from e
 
     token_ids = _extract_citation_tokens(answer)
-    citations: List[RagCitation] = []
-    for token_id in token_ids:
-        if 1 <= token_id <= len(items):
-            item = items[token_id - 1]
-            page_start, page_end = _page_range(item.locator)
-            citations.append(
-                RagCitation(
-                    ref_id=f"S{token_id}",
-                    item_id=item.item_id,
-                    page_start=page_start,
-                    page_end=page_end,
-                    score=item.score,
-                )
-            )
+    citations = _map_token_ids_to_citations(token_ids, items)
 
     return RagAnswerResponse(answer=answer, citations=citations, retrieved=items)
 
@@ -468,6 +558,7 @@ def rag_outline(req: RagOutlineRequest) -> RagOutlineResponse:
             raise ValueError("missing JSON object braces")
         parsed = json.loads(cleaned)
     except Exception as e:
+        logger.error("Outline JSON parse failed. raw_output_head=%s", raw_output[:500])
         raise HTTPException(
             status_code=500,
             detail=f"Outline JSON parse failed: {e}; output_head={raw_output[:200]}",
@@ -496,24 +587,191 @@ def rag_outline(req: RagOutlineRequest) -> RagOutlineResponse:
         )
 
     token_ids = _extract_outline_citation_tokens(sections)
-    citations: List[RagCitation] = []
-    for token_id in token_ids:
-        if 1 <= token_id <= len(context_items):
-            item = context_items[token_id - 1]
-            page_start, page_end = _page_range(item.locator)
-            citations.append(
-                RagCitation(
-                    ref_id=f"S{token_id}",
-                    item_id=item.item_id,
-                    page_start=page_start,
-                    page_end=page_end,
-                    score=item.score,
-                )
-            )
+    citations = _map_token_ids_to_citations(token_ids, context_items)
 
     return RagOutlineResponse(
         title=title,
         sections=sections,
         citations=citations,
         retrieved=context_items if req.include_retrieved else None,
+    )
+
+
+@app.post("/rag/slides/plan", response_model=RagSlidesPlanResponse)
+def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
+    query_text = (req.query or "").strip()
+
+    if req.outline is not None and query_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide only one of outline or query, not both",
+        )
+
+    if req.outline is None and not query_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'outline' or 'query'",
+        )
+
+    project = os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID") or ""
+    llm_location = os.environ.get("VERTEX_LLM_LOCATION") or os.environ.get("GCP_LOCATION") or os.environ.get("LOCATION") or ""
+    llm_location = _normalize_location(llm_location, name="VERTEX_LLM_LOCATION")
+    model = os.environ.get("VERTEX_LLM_MODEL") or ""
+    if not project or not llm_location or not model:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing GCP_PROJECT/PROJECT_ID or VERTEX_LLM_LOCATION/GCP_LOCATION/LOCATION or VERTEX_LLM_MODEL",
+        )
+
+    outline_used: Optional[RagOutlineResponse] = None
+    retrieved: Optional[List[RetrievedItem]] = None
+
+    if req.outline is not None:
+        raw = req.outline
+        sections_raw = raw.get("sections")
+        if not isinstance(sections_raw, list):
+            raise HTTPException(status_code=400, detail="outline.sections must be a list")
+        sections: List[RagOutlineSection] = []
+        for sec in sections_raw:
+            if not isinstance(sec, dict):
+                continue
+            sections.append(
+                RagOutlineSection(
+                    id=int(sec.get("id", 0)),
+                    heading=str(sec.get("heading") or "").strip(),
+                    learning_objectives=[str(x).strip() for x in sec.get("learning_objectives", []) if str(x).strip()],
+                    key_points=[str(x).strip() for x in sec.get("key_points", []) if str(x).strip()],
+                    citations=[str(x).strip() for x in sec.get("citations", []) if str(x).strip()],
+                )
+            )
+        citations_raw = raw.get("citations") if isinstance(raw.get("citations"), list) else []
+        citations: List[RagCitation] = []
+        for c in citations_raw:
+            if not isinstance(c, dict):
+                continue
+            citations.append(
+                RagCitation(
+                    ref_id=str(c.get("ref_id") or "").strip(),
+                    item_id=str(c.get("item_id") or "").strip(),
+                    page_start=int(c.get("page_start", 0)),
+                    page_end=int(c.get("page_end", 0)),
+                    score=float(c.get("score", 0.0)),
+                )
+            )
+        if req.include_retrieved and isinstance(raw.get("retrieved"), list):
+            retrieved = []
+            for item in raw["retrieved"]:
+                if not isinstance(item, dict):
+                    continue
+                retrieved.append(
+                    RetrievedItem(
+                        item_id=str(item.get("item_id") or "").strip(),
+                        score=float(item.get("score", 0.0)),
+                        text=str(item.get("text") or ""),
+                        locator=item.get("locator"),
+                        doc_id=item.get("doc_id"),
+                        version_id=item.get("version_id"),
+                        item_type=item.get("item_type"),
+                    )
+                )
+        outline_used = RagOutlineResponse(
+            title=str(raw.get("title") or "").strip(),
+            sections=sections,
+            citations=citations,
+            retrieved=retrieved if req.include_retrieved else None,
+        )
+    else:
+        outline_used = rag_outline(
+            RagOutlineRequest(
+                query=query_text,
+                top_k=req.top_k,
+                doc_id=req.doc_id,
+                version=req.version,
+                max_sections=req.max_sections or 10,
+                include_retrieved=req.include_retrieved,
+            )
+        )
+        retrieved = outline_used.retrieved if req.include_retrieved else None
+
+    if not outline_used.title:
+        raise HTTPException(status_code=400, detail="outline.title is required")
+
+    dedup_sections = _dedupe_outline_sections(outline_used.sections)
+    if not dedup_sections:
+        raise HTTPException(status_code=400, detail="outline.sections is empty")
+    target_slides = min(req.max_slides, max(1, len(dedup_sections) * req.slides_per_section))
+    outline_for_prompt = {
+        "title": outline_used.title,
+        "sections": [s.model_dump() for s in dedup_sections],
+    }
+    prompt = _make_slides_plan_prompt(
+        json.dumps(outline_for_prompt, ensure_ascii=False),
+        target_slides=target_slides,
+        max_slides=req.max_slides,
+    )
+
+    try:
+        raw_output = llm_generate_text(
+            prompt,
+            temperature=0.2,
+            max_output_tokens=2600,
+            model=model,
+            project=project,
+            location=llm_location,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM failed: {e}") from e
+
+    try:
+        cleaned = _strip_json_fences(raw_output)
+        if not cleaned:
+            raise ValueError("missing JSON object braces")
+        parsed = json.loads(cleaned)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Slides plan JSON parse failed: {e}; output_head={raw_output[:200]}",
+        ) from e
+
+    slides_raw = parsed.get("slides")
+    if not isinstance(slides_raw, list):
+        raise HTTPException(status_code=500, detail="Slides JSON invalid: slides must be a list")
+
+    citation_by_ref = {c.ref_id: c for c in outline_used.citations}
+    slides: List[RagSlidePlanItem] = []
+    seen_titles: set[str] = set()
+    for idx, slide in enumerate(slides_raw, start=1):
+        if len(slides) >= req.max_slides:
+            break
+        if not isinstance(slide, dict):
+            continue
+        title = str(slide.get("title") or "").strip()
+        if not title:
+            continue
+        norm_title = " ".join(title.lower().split())
+        if norm_title in seen_titles:
+            continue
+        seen_titles.add(norm_title)
+        citations = [str(x).strip() for x in slide.get("citations", []) if str(x).strip()]
+        slides.append(
+            RagSlidePlanItem(
+                slide_no=int(slide.get("slide_no", idx)),
+                title=title,
+                bullets=[str(x).strip() for x in slide.get("bullets", []) if str(x).strip()],
+                speaker_notes=(str(slide.get("speaker_notes")).strip() if slide.get("speaker_notes") is not None else None),
+                citations=citations,
+                sources=_map_ref_tokens_to_citations(citations, citation_by_ref),
+            )
+        )
+
+    for idx, slide in enumerate(slides, start=1):
+        slide.slide_no = idx
+
+    if not slides:
+        raise HTTPException(status_code=500, detail="Slides plan JSON invalid: produced 0 slides")
+
+    return RagSlidesPlanResponse(
+        slides=slides,
+        outline_used=outline_used if req.outline is None else None,
+        retrieved=retrieved if req.include_retrieved else None,
     )

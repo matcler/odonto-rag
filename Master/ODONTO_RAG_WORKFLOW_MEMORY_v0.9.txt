@@ -367,3 +367,56 @@ Addendum — 2026-02-11 (STEP 8 MVP)
 - Response model: `RagOutlineResponse` with `title`, structured `sections`, resolved `citations` (`RagCitation` mapped from `S#` tokens to item/page ranges), and optional `retrieved` payload.
 - Env vars reused (no new env required): `GCP_PROJECT`/`PROJECT_ID`, `VERTEX_LLM_LOCATION` (or `GCP_LOCATION`/`LOCATION` fallback), `VERTEX_LLM_MODEL`, plus retrieval-side vars (`VERTEX_EMBED_LOCATION`, `VERTEX_EMBED_MODEL`, `QDRANT_URL`, `QDRANT_API_KEY`).
 - outline parser now strips ```json fences
+
+UPDATE LOG — v0.10 (APPEND-ONLY)
+=================================
+Date: 2026-02-11
+
+STEP 9 implemented (slide planning)
+-----------------------------------
+- Added new POST endpoint `/rag/slides/plan` in `src/odonto_rag/api/rag_app.py`.
+- Request supports two paths:
+  - `outline` provided: plans slides from the given outline JSON.
+  - `query` provided (without outline): generates outline by reusing `/rag/outline` logic, then plans slides.
+- Added strict JSON parsing with fenced-output cleanup for slide-plan LLM output.
+- Added lightweight dedup:
+  - outline section heading dedup before planning
+  - slide title dedup after generation
+- Added slide source mapping from citation tokens (`S#`) to `RagCitation` with `page_start/page_end`.
+- Response returns `slides` and, on query path, `outline_used`; optional `retrieved` respected via `include_retrieved`.
+
+Files touched
+-------------
+- src/odonto_rag/api/rag_app.py
+- Master/ODONTO_RAG_WORKFLOW_MEMORY_v0.9.txt
+
+How to test
+-----------
+- Start API: `uvicorn odonto_rag.api.rag_app:app --reload --port 8000`
+- Smoke test query path: POST `/rag/slides/plan` with `{query, version, ...}`
+- Smoke test outline path: POST `/rag/slides/plan` with `{outline, version, ...}`
+
+Next step
+---------
+- STEP 10: PPTX generation from slide plan output.
+
+v0.10 (hardening)
+-----------------
+Cosa aggiunto
+- Validator XOR su `RagSlidesPlanRequest` (`outline` XOR `query`):
+  - errore chiaro se mancano entrambi: "Provide either 'outline' or 'query'"
+  - errore chiaro se presenti entrambi: "Provide only one of 'outline' or 'query', not both"
+- `max_sections` reso opzionale in `RagSlidesPlanRequest` (default `None`), con default operativo `10` solo nel path che genera outline internamente.
+- Guardrail output slide: se dopo parsing+dedup risultano 0 slide, ritorna HTTP 500 con detail esplicito.
+- Prompt input per LLM aggiornato con `json.dumps(..., ensure_ascii=False)`.
+
+Files touched
+- src/odonto_rag/api/rag_app.py
+- Master/ODONTO_RAG_WORKFLOW_MEMORY_v0.9.txt
+
+Comandi test
+- python -m compileall src/odonto_rag/api/rag_app.py
+- uvicorn odonto_rag.api.rag_app:app --port 8010
+- curl POST /rag/slides/plan (query path)
+- curl POST /rag/slides/plan (outline path)
+- v0.10 hardening fix XOR: `/rag/slides/plan` now returns HTTP 400 when both `outline` and non-empty `query` are provided.
