@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
+import sqlite3
 import subprocess
 import re
 from typing import Any, Dict, List, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 try:
     from pydantic import model_validator
@@ -18,6 +21,7 @@ except ImportError:  # pydantic v1 fallback
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
+from odonto_rag.deck.pptx_builder import build_pptx_from_slide_plan
 from odonto_rag.rag.providers.vertex import llm_generate_text
 
 logger = logging.getLogger(__name__)
@@ -104,6 +108,9 @@ class RagCitation(BaseModel):
     page_start: int
     page_end: int
     score: float
+    doc_id: Optional[str] = None
+    doc_citation: Optional[str] = None
+    doc_filename: Optional[str] = None
 
 
 class RagAnswerResponse(BaseModel):
@@ -162,6 +169,17 @@ class RagSlidesPlanResponse(BaseModel):
     slides: List[RagSlidePlanItem]
     outline_used: Optional[RagOutlineResponse] = None
     retrieved: Optional[List[RetrievedItem]] = None
+
+
+class RagSlidesPptxRequest(BaseModel):
+    slide_plan: Dict[str, Any]
+    filename: Optional[str] = None
+
+
+class RagSlidesPptxResponse(BaseModel):
+    path: str
+    filename: str
+    size_bytes: int
 
 
 app = FastAPI(title="Odonto RAG API", version="0.1.0")
@@ -382,6 +400,7 @@ def _map_token_ids_to_citations(
                     page_start=page_start,
                     page_end=page_end,
                     score=item.score,
+                    doc_id=item.doc_id,
                 )
             )
     return citations
@@ -404,6 +423,100 @@ def _map_ref_tokens_to_citations(
             seen.add(ref)
             out.append(c)
     return out
+
+
+def _catalog_db_path() -> str:
+    env_path = (os.environ.get("SQLITE_PATH") or os.environ.get("CATALOG_DB_PATH") or "").strip()
+    if env_path:
+        return env_path
+    if Path("catalog.sqlite3").exists():
+        return "catalog.sqlite3"
+    return "data/catalog.db"
+
+
+def _basename_from_uri_or_path(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    return Path(raw.split("?", 1)[0].rstrip("/")).name
+
+
+def _load_documents_metadata(doc_ids: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
+    unique_doc_ids = [d for d in dict.fromkeys(doc_ids) if d]
+    if not unique_doc_ids:
+        return {}
+    db_path = _catalog_db_path()
+    if not Path(db_path).exists():
+        return {}
+
+    out: Dict[str, Dict[str, Optional[str]]] = {}
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        chunk_size = 500
+        for i in range(0, len(unique_doc_ids), chunk_size):
+            chunk = unique_doc_ids[i : i + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            q = (
+                "SELECT doc_id, gcs_raw_path, metadata_json "
+                "FROM documents "
+                f"WHERE doc_id IN ({placeholders})"
+            )
+            for row in cur.execute(q, chunk):
+                metadata_obj: Dict[str, Any] = {}
+                raw_metadata = row["metadata_json"]
+                if isinstance(raw_metadata, dict):
+                    metadata_obj = raw_metadata
+                if isinstance(raw_metadata, str) and raw_metadata.strip():
+                    try:
+                        parsed = json.loads(raw_metadata)
+                        if isinstance(parsed, dict):
+                            metadata_obj = parsed
+                    except Exception:
+                        metadata_obj = {}
+                doc_id = str(row["doc_id"]) if row["doc_id"] is not None else ""
+                if not doc_id:
+                    continue
+                out[doc_id] = {
+                    "doc_citation": str(metadata_obj.get("citation")).strip() if metadata_obj.get("citation") else None,
+                    "doc_filename": _basename_from_uri_or_path(str(row["gcs_raw_path"] or "")) or None,
+                }
+    except Exception as e:
+        logger.warning("Doc metadata enrichment skipped: %s", e)
+        return {}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return out
+
+
+def _enrich_citation_map_with_doc_metadata(
+    citation_by_ref: Dict[str, RagCitation],
+    item_doc_map: Dict[str, str],
+) -> Dict[str, RagCitation]:
+    doc_ids = []
+    for c in citation_by_ref.values():
+        resolved_doc_id = c.doc_id or item_doc_map.get(c.item_id, "")
+        if resolved_doc_id:
+            doc_ids.append(resolved_doc_id)
+    docs_meta = _load_documents_metadata(doc_ids)
+    enriched: Dict[str, RagCitation] = {}
+    for ref, citation in citation_by_ref.items():
+        resolved_doc_id = citation.doc_id or item_doc_map.get(citation.item_id, "")
+        doc_meta = docs_meta.get(resolved_doc_id, {})
+        update = {
+            "doc_id": resolved_doc_id or None,
+            "doc_citation": doc_meta.get("doc_citation"),
+            "doc_filename": doc_meta.get("doc_filename"),
+        }
+        if hasattr(citation, "model_copy"):
+            enriched[ref] = citation.model_copy(update=update)  # type: ignore[attr-defined]
+        else:
+            enriched[ref] = citation.copy(update=update)
+    return enriched
 
 
 def _dedupe_outline_sections(sections: List[RagOutlineSection]) -> List[RagOutlineSection]:
@@ -656,6 +769,9 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
                     page_start=int(c.get("page_start", 0)),
                     page_end=int(c.get("page_end", 0)),
                     score=float(c.get("score", 0.0)),
+                    doc_id=(str(c.get("doc_id")).strip() if c.get("doc_id") is not None else None),
+                    doc_citation=(str(c.get("doc_citation")).strip() if c.get("doc_citation") is not None else None),
+                    doc_filename=(str(c.get("doc_filename")).strip() if c.get("doc_filename") is not None else None),
                 )
             )
         if req.include_retrieved and isinstance(raw.get("retrieved"), list):
@@ -737,7 +853,17 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
     if not isinstance(slides_raw, list):
         raise HTTPException(status_code=500, detail="Slides JSON invalid: slides must be a list")
 
+    item_doc_map: Dict[str, str] = {}
+    if retrieved:
+        for item in retrieved:
+            if item.item_id and item.doc_id:
+                item_doc_map[item.item_id] = item.doc_id
+    for c in outline_used.citations:
+        if c.item_id and c.doc_id and c.item_id not in item_doc_map:
+            item_doc_map[c.item_id] = c.doc_id
+
     citation_by_ref = {c.ref_id: c for c in outline_used.citations}
+    citation_by_ref = _enrich_citation_map_with_doc_metadata(citation_by_ref, item_doc_map)
     slides: List[RagSlidePlanItem] = []
     seen_titles: set[str] = set()
     for idx, slide in enumerate(slides_raw, start=1):
@@ -774,4 +900,36 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
         slides=slides,
         outline_used=outline_used if req.outline is None else None,
         retrieved=retrieved if req.include_retrieved else None,
+    )
+
+
+@app.post("/rag/slides/pptx", response_model=RagSlidesPptxResponse)
+def rag_slides_pptx(req: RagSlidesPptxRequest, download: int = 0) -> RagSlidesPptxResponse | FileResponse:
+    slides = req.slide_plan.get("slides") if isinstance(req.slide_plan, dict) else None
+    if not isinstance(slides, list) or not slides:
+        raise HTTPException(status_code=400, detail="slide_plan['slides'] must be a non-empty list")
+
+    try:
+        pptx_output_dir = os.environ.get("PPTX_OUTPUT_DIR", "out/decks")
+        out_path = build_pptx_from_slide_plan(
+            req.slide_plan,
+            out_dir=pptx_output_dir,
+            filename=req.filename,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PPTX build failed: {e}") from e
+
+    if download == 1:
+        return FileResponse(
+            path=str(out_path),
+            filename=out_path.name,
+            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        )
+
+    return RagSlidesPptxResponse(
+        path=str(out_path),
+        filename=out_path.name,
+        size_bytes=out_path.stat().st_size,
     )
