@@ -7,8 +7,17 @@ import re
 from typing import Any, Dict, Optional
 
 from pptx import Presentation
+from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.enum.text import PP_ALIGN
 from pptx.util import Inches, Pt
+
+FONT_NAME = "Calibri"
+TITLE_FONT_SIZE_PT = 32
+BODY_FONT_SIZE_PT = 20
+FOOTER_FONT_SIZE_PT = 8
+MAX_BULLETS_PER_SLIDE = 6
+MAX_BULLET_CHARS = 170
+MAX_TITLE_CHARS = 90
 
 
 def _slugify(value: str) -> str:
@@ -18,6 +27,13 @@ def _slugify(value: str) -> str:
 
 
 def _truncate_footer_label(text: str, limit: int = 200) -> str:
+    value = (text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _truncate_text(text: str, limit: int) -> str:
     value = (text or "").strip()
     if len(value) <= limit:
         return value
@@ -58,27 +74,55 @@ def build_pptx_from_slide_plan(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     prs = Presentation()
+    # Force widescreen 16:9.
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
 
     for idx, raw_slide in enumerate(slides, start=1):
         slide_data = raw_slide if isinstance(raw_slide, dict) else {}
-        title = str(slide_data.get("title") or f"Slide {idx}").strip()
+        title = _truncate_text(str(slide_data.get("title") or f"Slide {idx}"), MAX_TITLE_CHARS)
         bullets_raw = slide_data.get("bullets")
-        bullets = [str(b).strip() for b in bullets_raw if str(b).strip()] if isinstance(bullets_raw, list) else []
+        bullets = (
+            [_truncate_text(str(b), MAX_BULLET_CHARS) for b in bullets_raw if str(b).strip()]
+            if isinstance(bullets_raw, list)
+            else []
+        )
+        bullets = bullets[:MAX_BULLETS_PER_SLIDE]
         citations_raw = slide_data.get("citations")
         citations = [str(c).strip() for c in citations_raw if str(c).strip()] if isinstance(citations_raw, list) else []
         sources_raw = slide_data.get("sources")
         sources = [s for s in sources_raw if isinstance(s, dict)] if isinstance(sources_raw, list) else []
 
         slide = prs.slides.add_slide(prs.slide_layouts[1])
-        slide.shapes.title.text = title
+        title_shape = slide.shapes.title
+        title_shape.text = title
+        title_shape.left = Inches(0.6)
+        title_shape.top = Inches(0.3)
+        title_shape.width = Inches(12.1)
+        title_shape.height = Inches(0.9)
+        for p in title_shape.text_frame.paragraphs:
+            p.alignment = PP_ALIGN.LEFT
+            for run in p.runs:
+                run.font.name = FONT_NAME
+                run.font.size = Pt(TITLE_FONT_SIZE_PT)
 
         body_shape = slide.placeholders[1]
+        body_shape.left = Inches(0.7)
+        body_shape.top = Inches(1.25)
+        body_shape.width = Inches(11.9)
+        body_shape.height = Inches(4.8)
         text_frame = body_shape.text_frame
         text_frame.clear()
+        text_frame.word_wrap = True
+        text_frame.auto_size = MSO_AUTO_SIZE.NONE
         for bullet_idx, bullet in enumerate(bullets):
             paragraph = text_frame.paragraphs[0] if bullet_idx == 0 else text_frame.add_paragraph()
             paragraph.text = bullet
             paragraph.level = 0
+            paragraph.space_after = Pt(6)
+            for run in paragraph.runs:
+                run.font.name = FONT_NAME
+                run.font.size = Pt(BODY_FONT_SIZE_PT)
 
         footer_lines: list[str] = []
         if citations:
@@ -124,11 +168,14 @@ def build_pptx_from_slide_plan(
             )
             footer_frame = footer_box.text_frame
             footer_frame.clear()
+            footer_frame.word_wrap = True
+            footer_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
             footer_p = footer_frame.paragraphs[0]
             footer_p.text = "\n".join(footer_lines)
             footer_p.alignment = PP_ALIGN.LEFT
             for run in footer_p.runs:
-                run.font.size = Pt(8)
+                run.font.name = FONT_NAME
+                run.font.size = Pt(FOOTER_FONT_SIZE_PT)
 
         notes_parts = []
         speaker_notes = slide_data.get("speaker_notes")

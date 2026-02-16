@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import time
+import uuid
 from typing import List, Dict, Any, Callable, TypeVar
 
 import requests
@@ -11,7 +12,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
 
 from odonto_rag.catalog.db import make_engine, make_session_factory
-from odonto_rag.catalog.models import DocumentVersion
+from odonto_rag.catalog.models import Document, DocumentVersion
 
 
 T = TypeVar("T")
@@ -131,12 +132,14 @@ def _point_id(item: Dict[str, Any], idx: int) -> str:
     version_id = item.get("version_id", "unknown")
     raw = item.get("item_id")
     if raw:
-        return f"{doc_id}:{version_id}:{raw}"
+        seed = f"{doc_id}:{version_id}:{raw}"
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
     locator = item.get("locator") or {}
-    return (
+    seed = (
         f"{doc_id}:{version_id}:{item.get('item_type','item')}:"
         f"{locator.get('page_start','')}:{locator.get('page_end','')}:{idx}"
     )
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, seed))
 
 
 def _resolve_items_uri(doc_id: str, version: str, sqlite_path: str) -> str:
@@ -151,6 +154,21 @@ def _resolve_items_uri(doc_id: str, version: str, sqlite_path: str) -> str:
         if not dv.gcs_items_path:
             raise SystemExit("document_versions.gcs_items_path is empty")
         return dv.gcs_items_path
+
+
+def _resolve_doc_specialty(doc_id: str, sqlite_path: str) -> str | None:
+    engine = make_engine(sqlite_path)
+    Session = make_session_factory(engine)
+    with Session() as sess:
+        doc = sess.query(Document).filter(Document.doc_id == doc_id).one_or_none()
+        if doc is None:
+            return None
+        metadata = doc.metadata_json if isinstance(doc.metadata_json, dict) else {}
+        specialty = metadata.get("specialty")
+        if specialty is None:
+            return None
+        value = str(specialty).strip()
+        return value or None
 
 
 def main() -> None:
@@ -173,6 +191,7 @@ def main() -> None:
     qdrant_api_key = os.environ.get("QDRANT_API_KEY") or None
 
     items_uri = args.items_uri or _resolve_items_uri(args.doc_id, args.version_id, args.sqlite)
+    doc_specialty = _resolve_doc_specialty(args.doc_id, args.sqlite)
 
     print("items_uri:", items_uri)
     items = _load_items(items_uri)
@@ -181,6 +200,21 @@ def main() -> None:
 
     q = QdrantClient(url=qdrant_url, api_key=qdrant_api_key, timeout=60)
     collection = _collection_name(args.version_id, model)
+    doc_filter = qm.Filter(
+        must=[
+            qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=args.doc_id)),
+            qm.FieldCondition(key="version", match=qm.MatchValue(value=args.version_id)),
+        ]
+    )
+
+    # Keep indexing idempotent even if item_id values changed after a re-ingest.
+    _with_retries(
+        lambda: q.delete(
+            collection_name=collection,
+            points_selector=qm.FilterSelector(filter=doc_filter),
+            wait=True,
+        )
+    )
 
     total = 0
     for i in range(0, len(items), args.batch_size):
@@ -199,6 +233,7 @@ def main() -> None:
                 "version": item.get("version_id"),
                 "item_id": item.get("item_id"),
                 "item_type": item.get("item_type"),
+                "specialty": doc_specialty,
                 "locator": locator,
                 "page_start": locator.get("page_start"),
                 "page_end": locator.get("page_end"),
@@ -213,7 +248,9 @@ def main() -> None:
             print(f"upserted {total}/{len(items)}")
             time.sleep(0.1)
 
-    count = _with_retries(lambda: q.count(collection_name=collection, exact=True)).count
+    count = _with_retries(
+        lambda: q.count(collection_name=collection, count_filter=doc_filter, exact=True)
+    ).count
     print("collection:", collection)
     print("expected_n_items:", len(items))
     print("qdrant_count:", count)

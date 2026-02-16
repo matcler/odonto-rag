@@ -61,6 +61,7 @@ class RagQuery(BaseModel):
     top_k: int = Field(5, ge=1, le=50)
     snippet_len: int = Field(160, ge=1, le=2000)
     collection: Optional[str] = None
+    specialty: Optional[str] = None
 
 
 class RagResult(BaseModel):
@@ -100,6 +101,7 @@ class RagAnswerRequest(BaseModel):
     top_k: int = Field(5, ge=1, le=50)
     doc_id: Optional[str] = None
     version: str = Field(..., min_length=1)
+    specialty: Optional[str] = None
 
 
 class RagCitation(BaseModel):
@@ -125,6 +127,7 @@ class RagOutlineRequest(BaseModel):
     top_k: int = Field(25, ge=1, le=50)
     doc_id: Optional[str] = None
     version: str = Field(..., min_length=1)
+    specialty: Optional[str] = None
     max_sections: int = Field(10, ge=1, le=20)
     include_retrieved: bool = False
 
@@ -150,6 +153,7 @@ class RagSlidesPlanRequest(BaseModel):
     top_k: int = Field(25, ge=1, le=50)
     version: str = Field(..., min_length=1)
     doc_id: Optional[str] = None
+    specialty: Optional[str] = None
     max_sections: Optional[int] = Field(None, ge=1, le=20)
     slides_per_section: int = Field(2, ge=1, le=5)
     max_slides: int = Field(20, ge=1, le=50)
@@ -218,7 +222,11 @@ def _normalize_location(raw: str, *, name: str) -> str:
 
 
 def retrieve_items(
-    query: str, top_k: int, doc_id: Optional[str], version: Optional[str]
+    query: str,
+    top_k: int,
+    doc_id: Optional[str],
+    version: Optional[str],
+    specialty: Optional[str] = None,
 ) -> List[RetrievedItem]:
     project = os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID") or ""
     embed_location = os.environ.get("VERTEX_EMBED_LOCATION") or os.environ.get("GCP_LOCATION") or os.environ.get("LOCATION") or ""
@@ -245,15 +253,22 @@ def retrieve_items(
         raise HTTPException(status_code=500, detail=f"Embedding failed: {e}") from e
 
     q = QdrantClient(url=qdrant_url, api_key=api_key, timeout=60)
-    query_filter = None
+    must_conditions: List[qmodels.FieldCondition] = []
     if doc_id:
-        query_filter = qmodels.Filter(
-            must=[
-                qmodels.FieldCondition(
-                    key="doc_id", match=qmodels.MatchValue(value=doc_id)
-                )
-            ]
+        must_conditions.append(
+            qmodels.FieldCondition(
+                key="doc_id", match=qmodels.MatchValue(value=doc_id)
+            )
         )
+    if specialty:
+        normalized_specialty = specialty.strip()
+        if normalized_specialty:
+            must_conditions.append(
+                qmodels.FieldCondition(
+                    key="specialty", match=qmodels.MatchValue(value=normalized_specialty)
+                )
+            )
+    query_filter = qmodels.Filter(must=must_conditions) if must_conditions else None
 
     points = q.query_points(
         collection_name=collection,
@@ -519,6 +534,17 @@ def _enrich_citation_map_with_doc_metadata(
     return enriched
 
 
+def _missing_doc_citation_doc_ids(citations: List[RagCitation]) -> List[str]:
+    missing: set[str] = set()
+    for c in citations:
+        if not c.doc_id:
+            continue
+        if str(c.doc_citation or "").strip():
+            continue
+        missing.add(c.doc_id)
+    return sorted(missing)
+
+
 def _dedupe_outline_sections(sections: List[RagOutlineSection]) -> List[RagOutlineSection]:
     deduped: List[RagOutlineSection] = []
     seen: set[str] = set()
@@ -556,6 +582,7 @@ def rag_query(req: RagQuery) -> RagResponse:
         req.top_k,
         doc_id=None,
         version=collection,
+        specialty=req.specialty,
     )
 
     results: List[RagResult] = []
@@ -593,9 +620,15 @@ def rag_query(req: RagQuery) -> RagResponse:
 # curl -s -X POST http://localhost:8000/rag/query \
 #   -H "Content-Type: application/json" \
 #   -d '{"query":"What is the role of adhesive systems?","version_id":"v1-docai","top_k":3}' | jq
+# curl -s -X POST http://localhost:8000/rag/query \
+#   -H "Content-Type: application/json" \
+#   -d '{"query":"What is the role of adhesive systems?","version_id":"v1-docai","top_k":3,"specialty":"endodontics"}' | jq
 # curl -s -X POST http://localhost:8000/rag/answer \
 #   -H "Content-Type: application/json" \
 #   -d '{"query":"What is the role of adhesive systems?","top_k":3,"version":"v1-docai"}' | jq
+# curl -s -X POST http://localhost:8000/rag/slides/plan \
+#   -H "Content-Type: application/json" \
+#   -d '{"query":"Adhesive systems overview","top_k":5,"version":"v1-docai","specialty":"endodontics","include_retrieved":true}' | jq
 
 
 @app.post("/rag/answer", response_model=RagAnswerResponse)
@@ -610,7 +643,7 @@ def rag_answer(req: RagAnswerRequest) -> RagAnswerResponse:
             detail="Missing GCP_PROJECT/PROJECT_ID or VERTEX_LLM_LOCATION/GCP_LOCATION/LOCATION or VERTEX_LLM_MODEL",
         )
 
-    items = retrieve_items(req.query, req.top_k, req.doc_id, req.version)
+    items = retrieve_items(req.query, req.top_k, req.doc_id, req.version, req.specialty)
     context = _build_context(items, snippet_len=DEFAULT_ANSWER_SNIPPET_LEN)
     prompt = _make_answer_prompt(req.query, context)
 
@@ -648,7 +681,7 @@ def rag_outline(req: RagOutlineRequest) -> RagOutlineResponse:
     if not query_text:
         raise HTTPException(status_code=400, detail="Missing query/topic")
 
-    items = retrieve_items(query_text, req.top_k, req.doc_id, req.version)
+    items = retrieve_items(query_text, req.top_k, req.doc_id, req.version, req.specialty)
     context_items = _dedupe_header_items(items)
     context = _build_context(context_items, snippet_len=DEFAULT_OUTLINE_SNIPPET_LEN)
     prompt = _make_outline_prompt(query_text, context, req.max_sections)
@@ -803,6 +836,7 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
                 top_k=req.top_k,
                 doc_id=req.doc_id,
                 version=req.version,
+                specialty=req.specialty,
                 max_sections=req.max_sections or 10,
                 include_retrieved=req.include_retrieved,
             )
@@ -888,6 +922,19 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
                 citations=citations,
                 sources=_map_ref_tokens_to_citations(citations, citation_by_ref),
             )
+        )
+
+    missing_doc_ids: set[str] = set()
+    for slide in slides:
+        missing_doc_ids.update(_missing_doc_citation_doc_ids(slide.sources))
+    if missing_doc_ids:
+        missing_sorted = ", ".join(sorted(missing_doc_ids))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Missing document citation metadata for one or more sources. "
+                f"Set documents.metadata_json['citation'] for: {missing_sorted}"
+            ),
         )
 
     for idx, slide in enumerate(slides, start=1):

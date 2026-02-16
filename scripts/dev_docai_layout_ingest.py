@@ -5,9 +5,11 @@ import argparse
 import json
 import os
 import subprocess
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime
-from typing import Iterable
+from typing import Any, Iterable
 
 from google.protobuf.json_format import MessageToDict
 
@@ -24,6 +26,162 @@ def _ensure_dependencies() -> None:
         raise SystemExit(
             "Missing dependencies. Ensure gsutil and google-cloud-documentai are installed."
         ) from exc
+
+
+def _get_access_token() -> str:
+    try:
+        out = subprocess.check_output(["gcloud", "auth", "print-access-token"], text=True).strip()
+    except FileNotFoundError as exc:
+        raise SystemExit("gcloud not found. Install Google Cloud SDK and run 'gcloud auth login'.") from exc
+    if not out:
+        raise SystemExit("Empty access token. Run 'gcloud auth login'.")
+    return out
+
+
+def _parse_json_or_text(raw: bytes) -> dict[str, Any] | str:
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return text
+
+
+def _error_message_from_body(body: dict[str, Any] | str) -> str:
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            msg = str(err.get("message") or "").strip()
+            if msg:
+                return msg
+        msg = str(body.get("message") or "").strip()
+        if msg:
+            return msg
+        return json.dumps(body, ensure_ascii=False)
+    return str(body or "").strip()
+
+
+def _truncate_msg(msg: str, max_len: int = 300) -> str:
+    if len(msg) <= max_len:
+        return msg
+    return msg[: max_len - 1] + "…"
+
+
+def _non_200_body_excerpt(body: dict[str, Any] | str) -> str:
+    # Prefer JSON error.message if present; otherwise return body text/JSON dump.
+    return _truncate_msg(_error_message_from_body(body) or "<empty response body>")
+
+
+def _body_excerpt(body: dict[str, Any] | str) -> str:
+    if isinstance(body, dict):
+        return _truncate_msg(json.dumps(body, ensure_ascii=False))
+    return _truncate_msg(str(body or ""))
+
+
+def _docai_base_url(location: str) -> str:
+    loc = (location or "").strip()
+    if loc == "eu":
+        return "https://eu-documentai.googleapis.com"
+    if loc == "us":
+        return "https://us-documentai.googleapis.com"
+    return f"https://{loc}-documentai.googleapis.com"
+
+
+def http_get_json(url: str) -> tuple[int, dict[str, Any] | str]:
+    token = _get_access_token()
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = _parse_json_or_text(resp.read())
+            msg = _body_excerpt(body)
+            print(f"[docai] GET {url} -> status={int(resp.status)} body={msg}")
+            return int(resp.status), body
+    except urllib.error.HTTPError as exc:
+        body = _parse_json_or_text(exc.read() or b"")
+        msg = _non_200_body_excerpt(body)
+        print(f"[docai] GET {url} -> status={int(exc.code)} body={msg}")
+        return int(exc.code), body
+    except urllib.error.URLError as exc:
+        msg = _truncate_msg(str(exc.reason))
+        print(f"[docai] GET {url} -> status=0 message={msg}")
+        return 0, msg
+
+
+def _raise_permission_error(project: str, location: str, body: dict[str, Any] | str) -> None:
+    msg = _truncate_msg(_error_message_from_body(body))
+    raise SystemExit(
+        "Permission/API error while accessing Document AI in "
+        f"project={project}, location={location} (403). Details: {msg}"
+    )
+
+
+def resolve_processor_location(project: str, processor_id: str, preferred_location: str) -> str:
+    preferred = (preferred_location or "").strip()
+    check_locations: list[str] = []
+    if preferred:
+        check_locations.append(preferred)
+    for loc in ["us", "eu"]:
+        if loc not in check_locations:
+            check_locations.append(loc)
+
+    for location in check_locations:
+        url = (
+            f"{_docai_base_url(location)}/v1/projects/"
+            f"{project}/locations/{location}/processors/{processor_id}"
+        )
+        status, body = http_get_json(url)
+        if status == 200:
+            return location
+        if status == 403:
+            _raise_permission_error(project, location, body)
+        if status in (400, 404):
+            continue
+
+    for location in ["us", "eu"]:
+        list_url = (
+            f"{_docai_base_url(location)}/v1/projects/"
+            f"{project}/locations/{location}/processors"
+        )
+        status, body = http_get_json(list_url)
+        if status == 403:
+            _raise_permission_error(project, location, body)
+        if status == 400:
+            continue
+        if status != 200 or not isinstance(body, dict):
+            continue
+        processors = body.get("processors", [])
+        if not isinstance(processors, list):
+            continue
+        needle = f"/processors/{processor_id}"
+        for p in processors:
+            if not isinstance(p, dict):
+                continue
+            name = str(p.get("name") or "")
+            if needle in name:
+                return location
+
+    raise SystemExit(
+        f"Processor ID {processor_id} not found in project {project}. "
+        "Checked locations: preferred, us, eu. "
+        "Use Console to confirm processor ID/project."
+    )
+
+
+def _docai_api_endpoint(location: str) -> str:
+    loc = (location or "").strip()
+    if loc == "eu":
+        return "eu-documentai.googleapis.com"
+    if loc == "us":
+        return "us-documentai.googleapis.com"
+    return f"{loc}-documentai.googleapis.com"
 
 
 def _gsutil_cat(uri: str) -> bytes:
@@ -186,10 +344,21 @@ def main() -> None:
 
         from google.cloud import documentai
 
+        detected_location = resolve_processor_location(args.project, args.processor_id, args.location)
+        if args.location != detected_location:
+            print(
+                f"[docai] WARNING: processor not found in requested --location={args.location}; "
+                f"overriding with detected location={detected_location}"
+            )
+        else:
+            print(f"[docai] using requested location={args.location}")
+
+        api_endpoint = _docai_api_endpoint(detected_location)
         client = documentai.DocumentProcessorServiceClient(
-            client_options={"api_endpoint": f"{args.location}-documentai.googleapis.com"}
+            client_options={"api_endpoint": api_endpoint}
         )
-        processor = client.processor_path(args.project, args.location, args.processor_id)
+        processor = client.processor_path(args.project, detected_location, args.processor_id)
+        print(f"[docai] api_endpoint={api_endpoint} location={detected_location} processor={processor}")
 
         raw_doc = documentai.RawDocument(content=pdf_bytes, mime_type=args.mime_type)
         result = client.process_document(
