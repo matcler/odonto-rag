@@ -670,3 +670,319 @@ Workflow rules reminder
 - No git push without explicit confirmation.
 - Master remains append-only; updates delivered as downloadable .txt.
 
+# UPDATE LOG — v0.16 (APPEND-ONLY)
+Date: 2026-02-16 (Europe/Rome)
+
+## STEP S1 — FINAL VALIDATION (PASSED)
+Status: ✅ PASSED (multi-specialty scoped retrieval + slides)
+
+What was validated
+- Endodontics docs ingested and indexed:
+  - endo-clinical-radiographic-failure
+  - endo-fransson-2022
+- Scoped retrieval (`/rag/query`) returned only docs of the requested specialty.
+- Scoped slides plan (`/rag/slides/plan`) returned coherent doc_ids per specialty:
+  - implantology plan doc_ids:
+    - implant-macrodesign-10y
+    - implant-macrodesign-osseo
+  - endodontics plan doc_ids:
+    - endo-clinical-radiographic-failure
+    - endo-fransson-2022
+- PPTX generation completed for both specialties without cross-specialty contamination.
+
+Hardening completed in this step
+- Citation metadata now treated as mandatory for slide-quality output:
+  - existing docs backfilled with `metadata_json.citation`
+  - audit script added: `scripts/catalog_audit_citation.py`
+  - current audit status: `missing_citation=0`
+- Registration hardening:
+  - `scripts/dev_register_doc_version.py` now supports `--citation`
+  - new docs require citation at registration time
+  - existing docs without citation now fail registration update
+- Runtime hardening:
+  - `/rag/slides/plan` now fails fast if any source lacks `doc_citation`
+    (explicit error listing offending `doc_id`s)
+- Deck layout hardening:
+  - `src/odonto_rag/deck/pptx_builder.py` enforces 16:9 output (13.333 x 7.5)
+  - uniform fonts and bounded text to reduce overflow:
+    - title/body/footer standardized
+    - bullet/title truncation + bullet count cap
+
+## NEXT STEP — S2 Citation-grounded slide claims
+Goal
+- Ensure each slide claim is explicitly grounded in retrieved evidence.
+
+Scope
+1) Enforce per-bullet grounding
+- Every bullet must carry explicit sources as item references:
+  - `sources: [item_id, ...]` (or equivalent structured mapping).
+
+2) Enforce specialty-consistent sources
+- Validate that all source item_ids map to docs with the same requested specialty.
+- Reject or repair any mixed-specialty source assignment.
+
+3) Fallback policy for weak evidence
+- If support is insufficient for strong claims:
+  - reduce ambition (fewer claims, more definitions/overview content)
+  - avoid unsupported specific statements.
+
+4) Automated smoke gate
+- Add an automatic check asserting:
+  - every generated slide has coherent sources
+  - every bullet has at least one supporting source item
+  - all source docs match requested specialty.
+
+Acceptance criteria
+- S2 is PASS only when the automatic check succeeds for both:
+  - specialty=implantology
+  - specialty=endodontics
+
+# UPDATE LOG — v0.17 (APPEND-ONLY)
+Date: 2026-02-16 (Europe/Rome)
+
+## STEP S2 — Citation-grounded slide claims (MVP IMPLEMENTED)
+Status: ✅ PASSED (automatic smoke on implantology + endodontics)
+
+Implemented
+- API schema update:
+  - `RagSlidePlanItem` now includes:
+    - `bullet_source_item_ids: List[List[str]]`
+- Grounding validation in `/rag/slides/plan`:
+  - every slide must include `sources`
+  - every bullet must include at least one supporting `item_id` in `bullet_source_item_ids`
+  - bullet/source cardinality is validated
+- Specialty consistency validation:
+  - source docs are checked against requested `specialty`
+  - mismatch returns `HTTP 400` with explicit details
+- Fallback behavior (low evidence):
+  - if a generated slide has no mappable source from citations, generation falls back to lower-ambition content
+  - slide is grounded to available evidence (no unsupported claim-only output)
+
+Files added/updated
+- Updated: `src/odonto_rag/api/rag_app.py`
+- Added: `scripts/check_slides_plan_grounding.py`
+
+Automatic smoke gate
+1) Generate scoped plans:
+- implantology -> `/tmp/plan_implantology_s2.json`
+- endodontics -> `/tmp/plan_endodontics_s2.json`
+
+2) Validate grounding + specialty coherence:
+- `python3 scripts/check_slides_plan_grounding.py --plan-json /tmp/plan_implantology_s2.json --specialty implantology --db catalog.sqlite3`
+- `python3 scripts/check_slides_plan_grounding.py --plan-json /tmp/plan_endodontics_s2.json --specialty endodontics --db catalog.sqlite3`
+
+Observed result
+- Implantology check: `PASS` (`doc_ids=implant-macrodesign-10y,implant-macrodesign-osseo`)
+- Endodontics check: `PASS` (`doc_ids=endo-clinical-radiographic-failure,endo-fransson-2022`)
+
+Operational note
+- Citation metadata remains mandatory; `/rag/slides/plan` already fails if `doc_citation` is missing for used sources.
+
+# UPDATE LOG — v0.18 (APPEND-ONLY)
+Date: 2026-02-16 (Europe/Rome)
+
+## STEP S3 — Visual assets in slides (tables-first) status
+Status: ✅ IMPLEMENTED (MVP)
+
+What is now working
+- `slides/plan` can include `visuals` selected from deterministic asset candidates (specialty-safe).
+- `slides/pptx` renders visuals with fixed deterministic placement (1-up / 2-up policy).
+- Table visuals are now rendered as REAL PPTX tables (not snapshots) when `table_uri -> rows` is available.
+- Fallback policy remains deterministic (`MISSING_ASSET` notes / controlled degrade path).
+
+Validation snapshot
+- Implantology generated deck with real tables:
+  - `TABLE_SHAPES=10`, `PICTURE_SHAPES=0`
+- Endodontics generated deck with real tables:
+  - `TABLE_SHAPES=6`, `PICTURE_SHAPES=0`
+
+## NEXT STEP (planned) — Table hardening for coherence
+Primary objective
+- Improve consistency, readability, and semantic fidelity of rendered tables across decks.
+
+Hardening scope
+1) Table normalization
+- Stable row/column limits by layout profile.
+- Better header detection and header styling consistency.
+- Predictable truncation/wrapping rules per cell.
+
+2) Semantic coherence
+- Preserve meaningful column labels and units when available.
+- Reduce noisy rows and boilerplate artifacts from extraction.
+- Add deterministic row-priority rules (e.g., keep top informative rows).
+
+3) Visual coherence
+- Unified typography, padding, border thickness, and alignment.
+- Deterministic width allocation by content class (text vs numeric).
+- Safer behavior for oversized tables (split/compact policy).
+
+4) Auditability
+- Per-table render metadata in notes/logs (asset_id, doc_id, page, applied normalization policy).
+- Deterministic fallback reason codes when degradation occurs.
+
+# UPDATE LOG — v0.19 (APPEND-ONLY)
+Date: 2026-02-17 (Europe/Rome)
+
+## STEP S3.1 — Table hardening + planner fallback (IMPLEMENTED)
+Status: ✅ IMPLEMENTED (with regression fix)
+
+What was implemented
+- PPTX table rendering hardening in `src/odonto_rag/deck/pptx_builder.py`:
+  - Replaced placeholder captions (`Table from source`) with deterministic caption+locator format.
+  - Added per-table audit notes in speaker notes:
+    - `TABLE_1 asset_id=... doc_id=... locator=...`
+    - `TABLE_2 ...`
+  - Added deterministic table normalization:
+    - drop fully empty rows/columns
+    - header hole fill (`prev header` or `—`)
+    - optional spans-to-merge translation when span metadata exists
+  - Added consistent table style (header shading/bold, first-column emphasis, padding).
+
+- Slides planner deterministic fallback in `src/odonto_rag/api/rag_app.py`:
+  - If a slide has quantitative/table intent and no visual selected by the LLM,
+    auto-attach one top-ranked table candidate (deterministic ranking).
+  - Intent gate includes table/data tokens + numeric/percent patterns.
+  - Preference order for fallback table:
+    1) same source doc(s) as slide citations
+    2) semantic score to slide text
+    3) stable doc_id/asset_id tie-break.
+
+Regression discovered and fixed
+- During hardening, overflow policy in PPTX builder became too aggressive and forced table-as-image fallbacks.
+- Fix applied:
+  - keep table-as-shape as default,
+  - use compact mode (smaller font) instead of immediate image fallback,
+  - raise overflow threshold to reduce false-positive degrade.
+- Post-fix validation confirms real table shapes restored.
+
+Validation snapshot (implantology)
+- Plan v2 visual assignment: 7/10 slides with table visuals.
+- Final deck (post-fix):
+  - `out/decks/implantology_10slides_hardening_v3_true_tables.pptx`
+  - `SLIDES=10`
+  - `TABLE_SHAPES=7`
+  - `PICTURE_SHAPES=0`
+  - no `TABLE_RENDER_FALLBACK` notes.
+
+Files updated in this step
+- Updated: `src/odonto_rag/deck/pptx_builder.py`
+- Updated: `src/odonto_rag/api/rag_app.py`
+
+Operational note
+- The latest implantology deck now includes deterministic table grounding and keeps tables as native PPTX tables (not snapshots), except where explicit missing-asset conditions would require fallback.
+
+# UPDATE LOG — v0.20 (APPEND-ONLY)
+Date: 2026-02-17 (Europe/Rome)
+
+## STEP S3.2 — Keynote compatibility + output hygiene
+Status: ✅ IMPLEMENTED
+
+What was implemented
+- Added Keynote compatibility mode in PPTX builder:
+  - Env flag: `PPTX_KEYNOTE_SAFE=1`
+  - Compatibility behavior:
+    - conservative font/truncation handling,
+    - avoids note slides output,
+    - avoids fragile table merge behavior.
+
+- Added hybrid mode for Keynote + native tables:
+  - Env flag combination:
+    - `PPTX_KEYNOTE_SAFE=1`
+    - `PPTX_KEYNOTE_KEEP_TABLES=1`
+  - Result:
+    - Keynote-friendly package profile,
+    - real PPTX tables preserved (no snapshot fallback by policy).
+
+Validation artifacts
+- Keynote-safe (max compatibility):
+  - `out/decks/implantology_10slides_keynote_safe_v2.pptx`
+- Keynote-hybrid with native tables:
+  - `out/decks/implantology_10slides_keynote_hybrid_true_tables.pptx`
+  - XML/package check confirms 10 slides and 7 table markers, no note slides.
+
+Output folder cleanup
+- Per user request, `out/` was cleaned from obsolete test/temp artifacts:
+  - removed `test_*`, `tmp_*`, legacy generic outputs (`RAG_Slides_*`, `engine_test.pptx`, `final.pptx`, etc.), and `.DS_Store`.
+- Preserved:
+  - `out/assets/` (source visual cache)
+  - `out/decks/` (current implantology deliverables)
+
+Files updated in this step
+- Updated: `src/odonto_rag/deck/pptx_builder.py`
+- Updated: `src/odonto_rag/api/rag_app.py` (table fallback planner from previous sub-step)
+- Updated: `docs/master.md`
+
+# UPDATE LOG — v0.21 (APPEND-ONLY)
+Date: 2026-02-17 (Europe/Rome)
+
+## STEP S4 — Figure assets end-to-end (S4.1→S4.4)
+Status: ✅ IMPLEMENTED
+
+What was implemented
+- S4.1:
+  - Extended DocAI ingest asset extraction to include figure/image-like visual elements with `bbox + page` in `assets.jsonl`.
+  - Kept extraction-only behavior (no render in ingest).
+- S4.2:
+  - Hardened deterministic PDF→PNG crop renderer with cache-first behavior under `out/assets/<doc_id>/<version>/<asset_id>.png`.
+  - Added `--force` to bypass cache when needed.
+- S4.3:
+  - Added deterministic visual-candidate ranking that guarantees figure/image/chart candidates are available to planner.
+  - Added figure fallback intent path in planner.
+  - Strengthened slide grounding validation for visuals:
+    - render path must exist
+    - visual specialty must match requested specialty (when present).
+- S4.4:
+  - Kept deterministic 1-up/2-up visual rendering for figures in PPTX builder.
+  - Standardized figure notes to `FIGURE_n asset_id=... doc_id=... locator=...`.
+  - Preserved Keynote-safe behavior.
+
+Files updated in this step
+- Updated: `scripts/dev_docai_layout_ingest.py`
+- Updated: `scripts/dev_render_layout_assets.py`
+- Updated: `src/odonto_rag/api/rag_app.py`
+- Updated: `src/odonto_rag/deck/pptx_builder.py`
+- Updated: `docs/master.md`
+
+# UPDATE LOG — v0.22 (APPEND-ONLY)
+Date: 2026-02-17 (Europe/Rome)
+
+## STEP S4.5 — Figure fallback + anti-stretch render (IMPLEMENTED)
+Status: ✅ IMPLEMENTED
+
+What was implemented
+- Figure extraction hardening in ingest:
+  - `scripts/dev_docai_layout_ingest.py` now includes a deterministic PDF fallback detector
+    when DocAI layout does not emit figure/image blocks.
+  - Fallback writes figure assets with `asset_type=figure`, `bbox + page + locator`,
+    source tag: `pdf_fallback_connected_components`.
+  - Added opt-out flag: `--disable-figure-fallback`.
+
+- PPTX figure rendering quality fix:
+  - `src/odonto_rag/deck/pptx_builder.py` now renders pictures with preserved aspect ratio
+    (contain + centered in slot), avoiding stretched/distorted visuals.
+
+Validation run (implantology, v1-docai)
+- Re-ingested docs:
+  - `implant-lovatto-2018`
+  - `implant-macrodesign-10y`
+  - `implant-macrodesign-osseo`
+- Rendered/enriched assets regenerated in `out/assets/.../assets.enriched.jsonl`.
+- Observed figure assets:
+  - `implant-macrodesign-10y`: 5 figure assets detected
+  - other two docs remained table-only with current source structure.
+
+Deck generation + cleanup
+- Generated:
+  - `out/decks/implantology_main_10slides_fixed_aspect.pptx`
+- Cleaned output folder as requested:
+  - `out/decks/` now retains only the final deliverable above.
+
+Operational note
+- Planner behavior remains non-forced:
+  - visuals are inserted only when semantically relevant;
+  - no mandatory figure injection policy is applied.
+
+Files updated in this step
+- Updated: `scripts/dev_docai_layout_ingest.py`
+- Updated: `src/odonto_rag/deck/pptx_builder.py`
+- Updated: `docs/master.md`

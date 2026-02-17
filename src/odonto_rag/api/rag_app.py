@@ -164,6 +164,8 @@ class RagSlidePlanItem(BaseModel):
     slide_no: int
     title: str
     bullets: List[str]
+    bullet_source_item_ids: List[List[str]] = Field(default_factory=list)
+    visuals: List[Dict[str, Any]] = Field(default_factory=list)
     speaker_notes: Optional[str] = None
     citations: List[str]
     sources: List[RagCitation]
@@ -449,6 +451,376 @@ def _catalog_db_path() -> str:
     return "data/catalog.db"
 
 
+def _gs_read_bytes(uri: str) -> bytes:
+    if not uri.startswith("gs://"):
+        raise ValueError(f"Expected gs:// URI, got: {uri}")
+    try:
+        from google.cloud import storage
+
+        _, _, rest = uri.partition("gs://")
+        bucket_name, _, blob_name = rest.partition("/")
+        if not bucket_name or not blob_name:
+            raise ValueError(f"Invalid gs:// URI: {uri}")
+        blob = storage.Client().bucket(bucket_name).blob(blob_name)
+        return blob.download_as_bytes()
+    except Exception:
+        return subprocess.check_output(["gsutil", "cat", uri])
+
+
+def _load_assets_for_docs(
+    *,
+    doc_ids: List[str],
+    version: str,
+    specialty: Optional[str],
+    max_assets: int = 40,
+) -> List[Dict[str, Any]]:
+    unique_doc_ids = [d for d in dict.fromkeys(doc_ids) if d]
+    if not unique_doc_ids:
+        return []
+
+    db_path = _catalog_db_path()
+    if not Path(db_path).exists():
+        return []
+
+    docs_meta = _load_documents_metadata(unique_doc_ids)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        placeholders = ",".join("?" for _ in unique_doc_ids)
+        rows = conn.execute(
+            "SELECT doc_id, gcs_assets_path FROM document_versions "
+            f"WHERE version = ? AND doc_id IN ({placeholders})",
+            [version, *unique_doc_ids],
+        ).fetchall()
+    finally:
+        conn.close()
+
+    specialty_norm = (specialty or "").strip().lower()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        doc_id = str(row["doc_id"] or "")
+        assets_uri = str(row["gcs_assets_path"] or "")
+        raw_lines: List[str] = []
+        local_enriched = Path("out/assets") / doc_id / version / "assets.enriched.jsonl"
+        if local_enriched.exists():
+            try:
+                raw_lines = local_enriched.read_text(encoding="utf-8", errors="replace").splitlines()
+            except Exception:
+                raw_lines = []
+        if not raw_lines and assets_uri:
+            try:
+                raw_lines = _gs_read_bytes(assets_uri).decode("utf-8", errors="replace").splitlines()
+            except Exception:
+                raw_lines = []
+        if not raw_lines:
+            continue
+        for line in raw_lines:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                obj = json.loads(text)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            render_path = str(obj.get("render_path") or "").strip()
+            if not render_path or not Path(render_path).exists():
+                continue
+            obj_doc_id = str(obj.get("doc_id") or doc_id).strip()
+            obj_specialty = str(obj.get("specialty") or "").strip().lower()
+            if not obj_specialty:
+                obj_specialty = str((docs_meta.get(obj_doc_id, {}) or {}).get("doc_specialty") or "").strip().lower()
+            if specialty_norm and obj_specialty != specialty_norm:
+                continue
+            obj_type = str(obj.get("asset_type") or "").strip().lower()
+            if obj_type not in {"table", "figure", "image", "chart"}:
+                continue
+            asset_id = str(obj.get("asset_id") or "").strip()
+            if not asset_id:
+                continue
+            caption = _normalize_asset_caption(obj)
+            table_rows = _load_table_rows_for_asset(obj)
+            out.append(
+                {
+                    "asset_id": asset_id,
+                    "asset_type": obj_type,
+                    "doc_id": obj_doc_id,
+                    "specialty": obj_specialty or None,
+                    "caption": caption,
+                    "page": obj.get("page"),
+                    "locator": obj.get("locator"),
+                    "bbox": obj.get("bbox"),
+                    "render_path": render_path,
+                    "files": obj.get("files") if isinstance(obj.get("files"), dict) else {},
+                    "table_rows": table_rows,
+                }
+            )
+            if len(out) >= max_assets:
+                return out
+    return out
+
+
+def _load_table_rows_for_asset(asset: Dict[str, Any]) -> Optional[List[List[str]]]:
+    if str(asset.get("asset_type") or "").strip().lower() != "table":
+        return None
+    files = asset.get("files") if isinstance(asset.get("files"), dict) else {}
+    table_uri = str(files.get("table_uri") or "").strip()
+    if not table_uri:
+        return None
+    try:
+        payload = _gs_read_bytes(table_uri).decode("utf-8", errors="replace")
+        obj = json.loads(payload)
+    except Exception:
+        return None
+    rows = obj.get("rows") if isinstance(obj, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return None
+    out: List[List[str]] = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        normalized = [" ".join(str(cell or "").replace("\n", " ").split()) for cell in row]
+        if any(normalized):
+            out.append(normalized)
+    return out or None
+
+
+def _score_asset_for_query(asset: Dict[str, Any], query: str) -> float:
+    text = f"{asset.get('caption','')} {asset.get('asset_type','')}".lower()
+    q_tokens = [t for t in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(t) > 2]
+    if not q_tokens:
+        return 0.0
+    hits = sum(1 for t in q_tokens if t in text)
+    return float(hits)
+
+
+_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_TABLE_INTENT_TOKENS = {
+    "table",
+    "tabella",
+    "comparison",
+    "compare",
+    "confronto",
+    "data",
+    "dati",
+    "values",
+    "valori",
+    "percent",
+    "percentuale",
+    "metric",
+    "metrics",
+    "outcome",
+    "outcomes",
+    "risultati",
+    "result",
+    "results",
+}
+_QUANT_INTENT_TOKENS = {
+    "rate",
+    "rates",
+    "survival",
+    "followup",
+    "follow-up",
+    "years",
+    "months",
+    "incidence",
+    "prevalence",
+}
+_FIGURE_INTENT_TOKENS = {
+    "figure",
+    "figures",
+    "image",
+    "images",
+    "chart",
+    "charts",
+    "diagram",
+    "workflow",
+    "radiograph",
+    "radiographic",
+    "xray",
+    "x-ray",
+    "cbct",
+    "scan",
+    "photo",
+    "microscopy",
+}
+
+
+def _caption_is_unhelpful(caption: str) -> bool:
+    text = (caption or "").strip()
+    if not text:
+        return True
+    normalized = " ".join(text.lower().split())
+    if _UUID_RE.search(normalized):
+        return True
+    return bool(re.fullmatch(r"(table|tabella|figure|image|chart|asset)\s*[\w-]*", normalized))
+
+
+def _normalize_asset_caption(asset: Dict[str, Any]) -> str:
+    raw_caption = str(asset.get("caption") or "").strip()
+    if raw_caption and not _caption_is_unhelpful(raw_caption):
+        return raw_caption
+    asset_type = str(asset.get("asset_type") or "asset").strip().lower() or "asset"
+    page = asset.get("page")
+    try:
+        page_no = int(page)
+    except Exception:
+        page_no = 0
+    if page_no > 0:
+        return f"{asset_type.title()} (source page {page_no})"
+    return f"{asset_type.title()} from source"
+
+
+def _tokenize_for_match(text: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 2}
+
+
+def _visual_relevant_for_slide(visual: Dict[str, Any], title: str, bullets: List[str]) -> bool:
+    slide_tokens = _tokenize_for_match(" ".join([title] + bullets))
+    if not slide_tokens:
+        return False
+    visual_caption = str(visual.get("caption") or "").strip()
+    # Use only semantic surface (caption/type), not doc_id tokens, to avoid false-positive matches.
+    visual_text = " ".join([visual_caption, str(visual.get("asset_type") or "")])
+    visual_tokens = _tokenize_for_match(visual_text)
+    overlap = slide_tokens.intersection(visual_tokens)
+    if overlap:
+        return True
+    asset_type = str(visual.get("asset_type") or "").strip().lower()
+    if asset_type == "table":
+        has_table_intent = bool(slide_tokens.intersection(_TABLE_INTENT_TOKENS))
+        return has_table_intent and not _caption_is_unhelpful(visual_caption)
+    if asset_type in {"figure", "image", "chart"}:
+        return bool(slide_tokens.intersection(_FIGURE_INTENT_TOKENS))
+    return False
+
+
+def _slide_has_table_fallback_intent(title: str, bullets: List[str]) -> bool:
+    text = " ".join([title] + bullets).lower()
+    slide_tokens = _tokenize_for_match(text)
+    if slide_tokens.intersection(_TABLE_INTENT_TOKENS):
+        return True
+    if slide_tokens.intersection(_QUANT_INTENT_TOKENS):
+        return True
+    if re.search(r"\b\d+(?:[.,]\d+)?\s*%", text):
+        return True
+    numeric_tokens = re.findall(r"\b\d+(?:[.,]\d+)?\b", text)
+    return len(numeric_tokens) >= 2
+
+
+def _slide_has_figure_fallback_intent(title: str, bullets: List[str]) -> bool:
+    slide_tokens = _tokenize_for_match(" ".join([title] + bullets))
+    return bool(slide_tokens.intersection(_FIGURE_INTENT_TOKENS))
+
+
+def _select_table_fallback_for_slide(
+    *,
+    visual_candidates: List[Dict[str, Any]],
+    title: str,
+    bullets: List[str],
+    sources: List[RagCitation],
+    used_asset_ids: set[str],
+) -> List[Dict[str, Any]]:
+    source_doc_ids = {str(s.doc_id or "").strip() for s in sources if str(s.doc_id or "").strip()}
+    scoped: List[Dict[str, Any]] = []
+    for cand in visual_candidates:
+        if str(cand.get("asset_type") or "").strip().lower() != "table":
+            continue
+        aid = str(cand.get("asset_id") or "").strip()
+        if not aid or aid in used_asset_ids:
+            continue
+        scoped.append(cand)
+    if not scoped:
+        return []
+
+    query = " ".join([title] + bullets).strip()
+    ranked = sorted(
+        scoped,
+        key=lambda a: (
+            0 if str(a.get("doc_id") or "").strip() in source_doc_ids else 1,
+            -_score_asset_for_query(a, query),
+            str(a.get("doc_id") or ""),
+            str(a.get("asset_id") or ""),
+        ),
+    )
+    return ranked[:1]
+
+
+def _select_figure_fallback_for_slide(
+    *,
+    visual_candidates: List[Dict[str, Any]],
+    title: str,
+    bullets: List[str],
+    sources: List[RagCitation],
+    used_asset_ids: set[str],
+) -> List[Dict[str, Any]]:
+    source_doc_ids = {str(s.doc_id or "").strip() for s in sources if str(s.doc_id or "").strip()}
+    scoped: List[Dict[str, Any]] = []
+    for cand in visual_candidates:
+        if str(cand.get("asset_type") or "").strip().lower() not in {"figure", "image", "chart"}:
+            continue
+        aid = str(cand.get("asset_id") or "").strip()
+        if not aid or aid in used_asset_ids:
+            continue
+        scoped.append(cand)
+    if not scoped:
+        return []
+
+    query = " ".join([title] + bullets).strip()
+    ranked = sorted(
+        scoped,
+        key=lambda a: (
+            0 if str(a.get("doc_id") or "").strip() in source_doc_ids else 1,
+            -_score_asset_for_query(a, query),
+            str(a.get("doc_id") or ""),
+            str(a.get("asset_id") or ""),
+        ),
+    )
+    return ranked[:1]
+
+
+def _rank_visual_candidates_for_query(
+    assets: List[Dict[str, Any]],
+    query: str,
+    *,
+    max_assets: int,
+) -> List[Dict[str, Any]]:
+    ranked = sorted(
+        assets,
+        key=lambda a: (
+            -_score_asset_for_query(a, query),
+            str(a.get("doc_id") or ""),
+            str(a.get("asset_id") or ""),
+        ),
+    )
+    if not ranked:
+        return []
+    figure_like = [a for a in ranked if str(a.get("asset_type") or "").strip().lower() in {"figure", "image", "chart"}]
+    min_figures = min(max_assets, len(figure_like), 6)
+    selected: List[Dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    for a in figure_like[:min_figures]:
+        aid = str(a.get("asset_id") or "").strip()
+        if not aid or aid in selected_ids:
+            continue
+        selected.append(a)
+        selected_ids.add(aid)
+    for a in ranked:
+        if len(selected) >= max_assets:
+            break
+        aid = str(a.get("asset_id") or "").strip()
+        if not aid or aid in selected_ids:
+            continue
+        selected.append(a)
+        selected_ids.add(aid)
+    return selected[:max_assets]
+
+
 def _basename_from_uri_or_path(value: str) -> str:
     raw = (value or "").strip()
     if not raw:
@@ -496,6 +868,7 @@ def _load_documents_metadata(doc_ids: List[str]) -> Dict[str, Dict[str, Optional
                 out[doc_id] = {
                     "doc_citation": str(metadata_obj.get("citation")).strip() if metadata_obj.get("citation") else None,
                     "doc_filename": _basename_from_uri_or_path(str(row["gcs_raw_path"] or "")) or None,
+                    "doc_specialty": str(metadata_obj.get("specialty")).strip() if metadata_obj.get("specialty") else None,
                 }
     except Exception as e:
         logger.warning("Doc metadata enrichment skipped: %s", e)
@@ -545,6 +918,103 @@ def _missing_doc_citation_doc_ids(citations: List[RagCitation]) -> List[str]:
     return sorted(missing)
 
 
+def _extract_slide_bullets(raw_slide: Dict[str, Any]) -> List[str]:
+    bullets_raw = raw_slide.get("bullets")
+    out: List[str] = []
+    if not isinstance(bullets_raw, list):
+        return out
+    for b in bullets_raw:
+        if isinstance(b, str):
+            t = b.strip()
+            if t:
+                out.append(t)
+            continue
+        if isinstance(b, dict):
+            t = str(b.get("text") or b.get("bullet") or "").strip()
+            if t:
+                out.append(t)
+    return out
+
+
+def _unique_item_ids(sources: List[RagCitation]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for s in sources:
+        item_id = str(s.item_id or "").strip()
+        if not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+        out.append(item_id)
+    return out
+
+
+def _validate_slides_grounding(
+    slides: List[RagSlidePlanItem], requested_specialty: Optional[str]
+) -> None:
+    errors: List[str] = []
+    source_doc_ids: set[str] = set()
+
+    for slide in slides:
+        if len(slide.visuals) > 2:
+            errors.append(f"slide {slide.slide_no}: more than 2 visuals")
+        for v in slide.visuals:
+            aid = str(v.get("asset_id") or "").strip()
+            if not aid:
+                errors.append(f"slide {slide.slide_no}: visual without asset_id")
+            rpath = str(v.get("render_path") or "").strip()
+            if not rpath:
+                errors.append(f"slide {slide.slide_no}: visual {aid or '<missing>'} missing render_path")
+            elif not Path(rpath).exists():
+                errors.append(f"slide {slide.slide_no}: visual {aid or '<missing>'} render_path not found")
+            v_specialty = str(v.get("specialty") or "").strip().lower()
+            req_specialty = (requested_specialty or "").strip().lower()
+            if req_specialty and v_specialty and v_specialty != req_specialty:
+                errors.append(
+                    f"slide {slide.slide_no}: visual {aid or '<missing>'} specialty mismatch "
+                    f"({v_specialty} != {req_specialty})"
+                )
+            v_doc_id = str(v.get("doc_id") or "").strip()
+            if v_doc_id:
+                source_doc_ids.add(v_doc_id)
+
+        if not slide.sources:
+            errors.append(f"slide {slide.slide_no}: missing sources")
+        if not slide.bullets:
+            errors.append(f"slide {slide.slide_no}: missing bullets")
+            continue
+        if len(slide.bullet_source_item_ids) != len(slide.bullets):
+            errors.append(
+                f"slide {slide.slide_no}: bullet/source cardinality mismatch "
+                f"({len(slide.bullet_source_item_ids)} vs {len(slide.bullets)})"
+            )
+            continue
+        for i, item_ids in enumerate(slide.bullet_source_item_ids, start=1):
+            if not item_ids:
+                errors.append(f"slide {slide.slide_no} bullet {i}: empty source item_ids")
+        for src in slide.sources:
+            if src.doc_id:
+                source_doc_ids.add(src.doc_id)
+
+    normalized_specialty = (requested_specialty or "").strip().lower()
+    if normalized_specialty and source_doc_ids:
+        docs_meta = _load_documents_metadata(sorted(source_doc_ids))
+        mismatches: List[str] = []
+        for doc_id in sorted(source_doc_ids):
+            found = str((docs_meta.get(doc_id, {}) or {}).get("doc_specialty") or "").strip().lower()
+            if found != normalized_specialty:
+                mismatches.append(f"{doc_id}:{found or '<missing>'}")
+        if mismatches:
+            errors.append(
+                "specialty/source mismatch for docs: " + ", ".join(mismatches)
+            )
+
+    if errors:
+        raise HTTPException(
+            status_code=400,
+            detail="Slide grounding validation failed: " + " | ".join(errors),
+        )
+
+
 def _dedupe_outline_sections(sections: List[RagOutlineSection]) -> List[RagOutlineSection]:
     deduped: List[RagOutlineSection] = []
     seen: set[str] = set()
@@ -559,17 +1029,26 @@ def _dedupe_outline_sections(sections: List[RagOutlineSection]) -> List[RagOutli
 
 
 def _make_slides_plan_prompt(
-    outline_json: str, target_slides: int, max_slides: int
+    outline_json: str, target_slides: int, max_slides: int, visual_candidates_json: str
 ) -> str:
     return (
         "You are planning didactic dental slides from an outline.\n"
         "Return STRICT JSON only (no markdown, no code fences, no extra text).\n"
         "Use this schema exactly:\n"
-        '{ "slides": [ { "slide_no": int, "title": str, "bullets": [str], "speaker_notes": str, "citations": ["S1","S2"] } ] }\n'
+        '{ "slides": [ { "slide_no": int, "title": str, "bullets": [str], "speaker_notes": str, "citations": ["S1","S2"], "visuals": ["asset_id_1","asset_id_2"] } ] }\n'
         f"Generate around {target_slides} slides and never exceed {max_slides}.\n"
         "Avoid duplicate slide titles/headings.\n"
         "Use only citation tokens already present in the outline.\n\n"
+        "Grounding policy:\n"
+        "- Every bullet must be supportable by the slide citations.\n"
+        "- Visuals must be chosen ONLY from provided visual candidates.\n"
+        "- Visuals are optional: use an empty list when no visual is clearly relevant.\n"
+        "- Do NOT force one visual per slide; add tables only for data/comparison content.\n"
+        "- Select visuals by semantic match with slide title/bullets and candidate caption.\n"
+        "- Use at most 2 visuals per slide.\n"
+        "- If evidence is thin, reduce ambition: fewer claims, more definitions/overview.\n\n"
         f"Outline JSON:\n{outline_json}\n"
+        f"Visual candidates JSON:\n{visual_candidates_json}\n"
     )
 
 
@@ -850,6 +1329,32 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
     if not dedup_sections:
         raise HTTPException(status_code=400, detail="outline.sections is empty")
     target_slides = min(req.max_slides, max(1, len(dedup_sections) * req.slides_per_section))
+    citation_doc_ids = [c.doc_id for c in outline_used.citations if c.doc_id]
+    visual_candidates = _load_assets_for_docs(
+        doc_ids=[str(x) for x in citation_doc_ids if x],
+        version=req.version,
+        specialty=req.specialty,
+        max_assets=40,
+    )
+    visual_candidates = _rank_visual_candidates_for_query(
+        visual_candidates,
+        query_text or outline_used.title,
+        max_assets=20,
+    )
+    visual_candidate_ids = {str(a.get("asset_id") or "") for a in visual_candidates}
+    visual_candidates_json = json.dumps(
+        [
+            {
+                "asset_id": a.get("asset_id"),
+                "asset_type": a.get("asset_type"),
+                "doc_id": a.get("doc_id"),
+                "caption": a.get("caption"),
+                "page": a.get("page"),
+            }
+            for a in visual_candidates
+        ],
+        ensure_ascii=False,
+    )
     outline_for_prompt = {
         "title": outline_used.title,
         "sections": [s.model_dump() for s in dedup_sections],
@@ -858,6 +1363,7 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
         json.dumps(outline_for_prompt, ensure_ascii=False),
         target_slides=target_slides,
         max_slides=req.max_slides,
+        visual_candidates_json=visual_candidates_json,
     )
 
     try:
@@ -898,8 +1404,10 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
 
     citation_by_ref = {c.ref_id: c for c in outline_used.citations}
     citation_by_ref = _enrich_citation_map_with_doc_metadata(citation_by_ref, item_doc_map)
+    fallback_refs = sorted(citation_by_ref.keys(), key=lambda ref: int(ref[1:]) if ref[1:].isdigit() else 10**9)
     slides: List[RagSlidePlanItem] = []
     seen_titles: set[str] = set()
+    used_visual_asset_ids: set[str] = set()
     for idx, slide in enumerate(slides_raw, start=1):
         if len(slides) >= req.max_slides:
             break
@@ -913,14 +1421,83 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
             continue
         seen_titles.add(norm_title)
         citations = [str(x).strip() for x in slide.get("citations", []) if str(x).strip()]
+        bullets = _extract_slide_bullets(slide)
+        sources = _map_ref_tokens_to_citations(citations, citation_by_ref)
+
+        # Fallback for unsupported claims: keep slide conservative and tie it to available evidence.
+        if not sources and fallback_refs:
+            citations = [fallback_refs[0]]
+            sources = _map_ref_tokens_to_citations(citations, citation_by_ref)
+            if bullets:
+                bullets = bullets[:2]
+            else:
+                bullets = [
+                    f"Overview: {title}",
+                    "Key definitions and high-level concepts from available evidence.",
+                ]
+
+        source_item_ids = _unique_item_ids(sources)
+        bullet_source_item_ids = [list(source_item_ids) for _ in bullets]
+
+        visuals_raw = slide.get("visuals", [])
+        chosen_visual_ids: List[str] = []
+        if isinstance(visuals_raw, list):
+            for v in visuals_raw:
+                aid = str(v or "").strip()
+                if not aid or aid in chosen_visual_ids:
+                    continue
+                if aid not in visual_candidate_ids:
+                    continue
+                chosen_visual_ids.append(aid)
+                if len(chosen_visual_ids) >= 2:
+                    break
+        visuals: List[Dict[str, Any]] = []
+        for aid in chosen_visual_ids:
+            for cand in visual_candidates:
+                if str(cand.get("asset_id") or "") == aid:
+                    if _visual_relevant_for_slide(cand, title, bullets):
+                        visuals.append(cand)
+                        used_visual_asset_ids.add(aid)
+                    break
+
+        if not visuals and _slide_has_table_fallback_intent(title, bullets):
+            fallback_tables = _select_table_fallback_for_slide(
+                visual_candidates=visual_candidates,
+                title=title,
+                bullets=bullets,
+                sources=sources,
+                used_asset_ids=used_visual_asset_ids,
+            )
+            for v in fallback_tables:
+                aid = str(v.get("asset_id") or "").strip()
+                if aid:
+                    used_visual_asset_ids.add(aid)
+                visuals.append(v)
+
+        if not visuals and _slide_has_figure_fallback_intent(title, bullets):
+            fallback_figures = _select_figure_fallback_for_slide(
+                visual_candidates=visual_candidates,
+                title=title,
+                bullets=bullets,
+                sources=sources,
+                used_asset_ids=used_visual_asset_ids,
+            )
+            for v in fallback_figures:
+                aid = str(v.get("asset_id") or "").strip()
+                if aid:
+                    used_visual_asset_ids.add(aid)
+                visuals.append(v)
+
         slides.append(
             RagSlidePlanItem(
                 slide_no=int(slide.get("slide_no", idx)),
                 title=title,
-                bullets=[str(x).strip() for x in slide.get("bullets", []) if str(x).strip()],
+                bullets=bullets,
+                bullet_source_item_ids=bullet_source_item_ids,
+                visuals=visuals,
                 speaker_notes=(str(slide.get("speaker_notes")).strip() if slide.get("speaker_notes") is not None else None),
                 citations=citations,
-                sources=_map_ref_tokens_to_citations(citations, citation_by_ref),
+                sources=sources,
             )
         )
 
@@ -936,6 +1513,8 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
                 f"Set documents.metadata_json['citation'] for: {missing_sorted}"
             ),
         )
+
+    _validate_slides_grounding(slides, req.specialty)
 
     for idx, slide in enumerate(slides, start=1):
         slide.slide_no = idx
