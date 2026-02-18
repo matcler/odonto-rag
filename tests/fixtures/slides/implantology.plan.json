@@ -1,0 +1,133 @@
+{
+  "title": "Implantology Golden Deck",
+  "request": {
+    "mode": "query",
+    "query": "implant macrodesign principles",
+    "version": "v1-docai",
+    "specialty": "implantology"
+  },
+  "slides": [
+    {
+      "slide_no": 1,
+      "title": "Macrodesign Fundamentals",
+      "bullets": [
+        "Thread geometry influences primary stability.",
+        "Neck design affects crestal bone response."
+      ],
+      "bullet_source_item_ids": [
+        ["imp-item-001"],
+        ["imp-item-002"]
+      ],
+      "bullet_sources_structured": [
+        [
+          {
+            "item_id": "imp-item-001",
+            "doc_id": "implantology-golden-doc",
+            "locator": {
+              "page_start": 3,
+              "page_end": 3
+            },
+            "score": 0.91
+          }
+        ],
+        [
+          {
+            "item_id": "imp-item-002",
+            "doc_id": "implantology-golden-doc",
+            "locator": {
+              "page_start": 4,
+              "page_end": 4
+            },
+            "score": 0.89
+          }
+        ]
+      ],
+      "bullet_visual_asset_ids": [
+        [],
+        []
+      ],
+      "visual_role": "illustrative",
+      "visuals": [],
+      "citations": ["S1", "S2"],
+      "sources": [
+        {
+          "ref_id": "S1",
+          "item_id": "imp-item-001",
+          "page_start": 3,
+          "page_end": 3,
+          "score": 0.91,
+          "doc_id": "implantology-golden-doc"
+        },
+        {
+          "ref_id": "S2",
+          "item_id": "imp-item-002",
+          "page_start": 4,
+          "page_end": 4,
+          "score": 0.89,
+          "doc_id": "implantology-golden-doc"
+        }
+      ]
+    },
+    {
+      "slide_no": 2,
+      "title": "Clinical Outcomes Signals",
+      "bullets": [
+        "Short-term survival trends are linked to insertion torque.",
+        "Surface treatment modulates osseointegration timing."
+      ],
+      "bullet_source_item_ids": [
+        ["imp-item-003"],
+        ["imp-item-004"]
+      ],
+      "bullet_sources_structured": [
+        [
+          {
+            "item_id": "imp-item-003",
+            "doc_id": "implantology-golden-doc",
+            "locator": {
+              "page_start": 7,
+              "page_end": 7
+            },
+            "score": 0.87
+          }
+        ],
+        [
+          {
+            "item_id": "imp-item-004",
+            "doc_id": "implantology-golden-doc",
+            "locator": {
+              "page_start": 8,
+              "page_end": 8
+            },
+            "score": 0.85
+          }
+        ]
+      ],
+      "bullet_visual_asset_ids": [
+        [],
+        []
+      ],
+      "visual_role": "illustrative",
+      "visuals": [],
+      "citations": ["S3", "S4"],
+      "sources": [
+        {
+          "ref_id": "S3",
+          "item_id": "imp-item-003",
+          "page_start": 7,
+          "page_end": 7,
+          "score": 0.87,
+          "doc_id": "implantology-golden-doc"
+        },
+        {
+          "ref_id": "S4",
+          "item_id": "imp-item-004",
+          "page_start": 8,
+          "page_end": 8,
+          "score": 0.85,
+          "doc_id": "implantology-golden-doc"
+        }
+      ]
+    }
+  ]
+}
