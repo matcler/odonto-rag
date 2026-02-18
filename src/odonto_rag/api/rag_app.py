@@ -7,6 +7,8 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import re
+from datetime import datetime, timezone
+import zipfile
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -165,6 +167,9 @@ class RagSlidePlanItem(BaseModel):
     title: str
     bullets: List[str]
     bullet_source_item_ids: List[List[str]] = Field(default_factory=list)
+    bullet_sources_structured: List[List[Dict[str, Any]]] = Field(default_factory=list)
+    bullet_visual_asset_ids: List[List[str]] = Field(default_factory=list)
+    visual_role: str = "illustrative"
     visuals: List[Dict[str, Any]] = Field(default_factory=list)
     speaker_notes: Optional[str] = None
     citations: List[str]
@@ -173,6 +178,7 @@ class RagSlidePlanItem(BaseModel):
 
 class RagSlidesPlanResponse(BaseModel):
     slides: List[RagSlidePlanItem]
+    request: Optional[Dict[str, Any]] = None
     outline_used: Optional[RagOutlineResponse] = None
     retrieved: Optional[List[RetrievedItem]] = None
 
@@ -180,12 +186,15 @@ class RagSlidesPlanResponse(BaseModel):
 class RagSlidesPptxRequest(BaseModel):
     slide_plan: Dict[str, Any]
     filename: Optional[str] = None
+    evidence_bundle: bool = False
 
 
 class RagSlidesPptxResponse(BaseModel):
     path: str
     filename: str
     size_bytes: int
+    audit_path: Optional[str] = None
+    evidence_bundle_path: Optional[str] = None
 
 
 app = FastAPI(title="Odonto RAG API", version="0.1.0")
@@ -649,6 +658,23 @@ _FIGURE_INTENT_TOKENS = {
     "photo",
     "microscopy",
 }
+_VISUAL_EVIDENCE_CAPTION_TOKENS = {
+    "result",
+    "results",
+    "outcome",
+    "outcomes",
+    "shows",
+    "demonstrates",
+    "comparison",
+    "rate",
+    "survival",
+    "efficacy",
+    "performance",
+}
+_NUMERIC_UNIT_RE = re.compile(
+    r"\b\d+(?:[.,]\d+)?\s*(?:%|mm|cm|mg|g|kg|ml|l|months?|years?|yrs?)\b",
+    re.IGNORECASE,
+)
 
 
 def _caption_is_unhelpful(caption: str) -> bool:
@@ -716,6 +742,103 @@ def _slide_has_table_fallback_intent(title: str, bullets: List[str]) -> bool:
 def _slide_has_figure_fallback_intent(title: str, bullets: List[str]) -> bool:
     slide_tokens = _tokenize_for_match(" ".join([title] + bullets))
     return bool(slide_tokens.intersection(_FIGURE_INTENT_TOKENS))
+
+
+def _bullet_has_numeric_intent(text: str) -> bool:
+    lowered = (text or "").lower()
+    if re.search(r"\b\d+(?:[.,]\d+)?\s*%", lowered):
+        return True
+    if _NUMERIC_UNIT_RE.search(text or ""):
+        return True
+    tokens = _tokenize_for_match(lowered)
+    if tokens.intersection(_QUANT_INTENT_TOKENS):
+        return True
+    return bool(re.search(r"\b\d+(?:[.,]\d+)?\b", lowered))
+
+
+def _table_header_tokens(visual: Dict[str, Any]) -> set[str]:
+    rows = visual.get("table_rows")
+    if not isinstance(rows, list) or not rows:
+        return set()
+    first = rows[0]
+    if not isinstance(first, list):
+        return set()
+    return _tokenize_for_match(" ".join(str(c or "") for c in first))
+
+
+def _visual_match_tokens(visual: Dict[str, Any]) -> set[str]:
+    caption = str(visual.get("caption") or "").strip()
+    locator = visual.get("locator") if isinstance(visual.get("locator"), dict) else {}
+    locator_bits = [
+        str(locator.get("section_title") or ""),
+        str(locator.get("section") or ""),
+        str(locator.get("label") or ""),
+    ]
+    tokens = _tokenize_for_match(" ".join([caption, str(visual.get("asset_type") or "")] + locator_bits))
+    return tokens.union(_table_header_tokens(visual))
+
+
+def _caption_suggests_evidence(caption: str) -> bool:
+    tokens = _tokenize_for_match(caption or "")
+    if tokens.intersection(_VISUAL_EVIDENCE_CAPTION_TOKENS):
+        return True
+    if re.search(r"\bfigure\s*\d+\b", (caption or "").lower()):
+        return True
+    return False
+
+
+def _infer_visual_role(
+    title: str,
+    bullets: List[str],
+    visuals: List[Dict[str, Any]],
+) -> str:
+    if not visuals:
+        return "illustrative"
+    for v in visuals:
+        if str(v.get("asset_type") or "").strip().lower() == "table":
+            return "evidence"
+    for v in visuals:
+        if _caption_suggests_evidence(str(v.get("caption") or "")):
+            return "evidence"
+    # Last deterministic check: if slide text itself has strong quant/result intent, treat visuals as evidence.
+    if _slide_has_table_fallback_intent(title, bullets):
+        return "evidence"
+    return "illustrative"
+
+
+def _compute_bullet_visual_asset_ids(
+    bullets: List[str],
+    visuals: List[Dict[str, Any]],
+) -> List[List[str]]:
+    if not bullets:
+        return []
+    if not visuals:
+        return [[] for _ in bullets]
+
+    visuals_sorted = sorted(
+        [v for v in visuals if str(v.get("asset_id") or "").strip()],
+        key=lambda v: str(v.get("asset_id") or ""),
+    )
+    table_ids = [
+        str(v.get("asset_id") or "")
+        for v in visuals_sorted
+        if str(v.get("asset_type") or "").strip().lower() == "table"
+    ]
+    out: List[List[str]] = []
+    for bullet in bullets:
+        links: List[str] = []
+        bullet_tokens = _tokenize_for_match(bullet)
+        if _bullet_has_numeric_intent(bullet) and table_ids:
+            links.extend(table_ids[:1])
+        for visual in visuals_sorted:
+            aid = str(visual.get("asset_id") or "").strip()
+            if not aid:
+                continue
+            overlap = bullet_tokens.intersection(_visual_match_tokens(visual))
+            if overlap and aid not in links:
+                links.append(aid)
+        out.append(links)
+    return out
 
 
 def _select_table_fallback_for_slide(
@@ -918,6 +1041,324 @@ def _missing_doc_citation_doc_ids(citations: List[RagCitation]) -> List[str]:
     return sorted(missing)
 
 
+def _env_flag(name: str) -> bool:
+    return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _json_dumps_deterministic(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+
+
+def _source_locator_from_citation(src: Dict[str, Any]) -> Dict[str, int]:
+    try:
+        page_start = int(src.get("page_start", 0))
+    except Exception:
+        page_start = 0
+    try:
+        page_end = int(src.get("page_end", 0))
+    except Exception:
+        page_end = 0
+    return {"page_start": page_start, "page_end": page_end}
+
+
+def _build_bullet_sources_structured(
+    bullet_source_item_ids: List[List[str]],
+    sources: List[RagCitation],
+) -> List[List[Dict[str, Any]]]:
+    source_by_item: Dict[str, Dict[str, Any]] = {}
+    for src in sources:
+        item_id = str(src.item_id or "").strip()
+        if not item_id or item_id in source_by_item:
+            continue
+        src_payload = src.model_dump() if hasattr(src, "model_dump") else src.dict()
+        source_by_item[item_id] = {
+            "item_id": item_id,
+            "doc_id": str(src.doc_id or "").strip() or None,
+            "locator": _source_locator_from_citation(src_payload),
+            "score": float(src.score),
+            "ref_id": str(src.ref_id or "").strip() or None,
+        }
+
+    out: List[List[Dict[str, Any]]] = []
+    for item_ids in bullet_source_item_ids:
+        bullet_items: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in item_ids:
+            item_id = str(raw or "").strip()
+            if not item_id or item_id in seen:
+                continue
+            seen.add(item_id)
+            source = source_by_item.get(item_id)
+            if source:
+                bullet_items.append(dict(source))
+            else:
+                bullet_items.append(
+                    {
+                        "item_id": item_id,
+                        "doc_id": None,
+                        "locator": {"page_start": 0, "page_end": 0},
+                        "score": None,
+                        "ref_id": None,
+                    }
+                )
+        out.append(bullet_items)
+    return out
+
+
+def _render_path_exists(visual: Dict[str, Any]) -> bool:
+    render_path = str(visual.get("render_path") or "").strip()
+    return bool(render_path and Path(render_path).exists())
+
+
+def _extract_request_for_audit(slide_plan: Dict[str, Any]) -> Dict[str, Any]:
+    raw = slide_plan.get("request") if isinstance(slide_plan.get("request"), dict) else {}
+    mode = str(raw.get("mode") or "").strip()
+    if not mode:
+        mode = "query" if str(raw.get("query") or "").strip() else "outline"
+    return {
+        "mode": mode,
+        "query": str(raw.get("query") or "").strip() or None,
+        "outline_title": str(raw.get("outline_title") or "").strip() or None,
+        "version": str(raw.get("version") or "").strip() or None,
+        "specialty": str(raw.get("specialty") or "").strip() or None,
+        "timestamp": _utc_timestamp(),
+        "env_profile": {
+            "PPTX_KEYNOTE_SAFE": _env_flag("PPTX_KEYNOTE_SAFE"),
+            "PPTX_KEYNOTE_KEEP_TABLES": _env_flag("PPTX_KEYNOTE_KEEP_TABLES"),
+            "SLIDES_ENFORCE_NUMERIC_VISUAL_LINK": _env_flag("SLIDES_ENFORCE_NUMERIC_VISUAL_LINK"),
+            "SLIDES_ALLOW_MISSING_ASSET": _env_flag("SLIDES_ALLOW_MISSING_ASSET"),
+        },
+    }
+
+
+def _build_deck_audit_manifest(
+    slide_plan: Dict[str, Any],
+    deck_id: str,
+    deck_path: Path,
+) -> Dict[str, Any]:
+    slides_raw = slide_plan.get("slides")
+    if not isinstance(slides_raw, list):
+        slides_raw = []
+
+    slides_out: List[Dict[str, Any]] = []
+    unique_docs: set[str] = set()
+    unique_items: set[str] = set()
+    unique_assets: set[str] = set()
+    missing_assets: List[str] = []
+
+    for idx, raw_slide in enumerate(slides_raw, start=1):
+        slide = raw_slide if isinstance(raw_slide, dict) else {}
+        title = str(slide.get("title") or "").strip()
+        bullets = [str(x).strip() for x in (slide.get("bullets") or []) if str(x).strip()]
+        bullet_item_ids = slide.get("bullet_source_item_ids")
+        bullet_structured = slide.get("bullet_sources_structured")
+        bullet_visual_ids = slide.get("bullet_visual_asset_ids")
+        sources_raw = [s for s in (slide.get("sources") or []) if isinstance(s, dict)]
+        visuals_raw = [v for v in (slide.get("visuals") or []) if isinstance(v, dict)]
+
+        if not isinstance(bullet_item_ids, list):
+            bullet_item_ids = [[] for _ in bullets]
+        if not isinstance(bullet_structured, list):
+            bullet_structured = []
+        if not isinstance(bullet_visual_ids, list):
+            bullet_visual_ids = [[] for _ in bullets]
+
+        sources_by_item: Dict[str, Dict[str, Any]] = {}
+        for src in sources_raw:
+            item_id = str(src.get("item_id") or "").strip()
+            if item_id and item_id not in sources_by_item:
+                sources_by_item[item_id] = src
+
+        bullets_out: List[Dict[str, Any]] = []
+        for bullet_idx, bullet_text in enumerate(bullets):
+            structured_for_bullet = (
+                bullet_structured[bullet_idx]
+                if bullet_idx < len(bullet_structured) and isinstance(bullet_structured[bullet_idx], list)
+                else []
+            )
+            evidence_items: List[Dict[str, Any]] = []
+            if structured_for_bullet:
+                for item in structured_for_bullet:
+                    if not isinstance(item, dict):
+                        continue
+                    item_id = str(item.get("item_id") or "").strip()
+                    if not item_id:
+                        continue
+                    doc_id = str(item.get("doc_id") or "").strip()
+                    locator = item.get("locator") if isinstance(item.get("locator"), dict) else {"page_start": 0, "page_end": 0}
+                    evidence_items.append(
+                        {
+                            "item_id": item_id,
+                            "doc_id": doc_id or None,
+                            "locator": locator,
+                            "score": item.get("score"),
+                        }
+                    )
+            else:
+                item_ids = (
+                    bullet_item_ids[bullet_idx]
+                    if bullet_idx < len(bullet_item_ids) and isinstance(bullet_item_ids[bullet_idx], list)
+                    else []
+                )
+                for raw_item in item_ids:
+                    item_id = str(raw_item or "").strip()
+                    if not item_id:
+                        continue
+                    src = sources_by_item.get(item_id, {})
+                    doc_id = str(src.get("doc_id") or "").strip()
+                    evidence_items.append(
+                        {
+                            "item_id": item_id,
+                            "doc_id": doc_id or None,
+                            "locator": _source_locator_from_citation(src),
+                            "score": src.get("score"),
+                        }
+                    )
+
+            for ev in evidence_items:
+                item_id = str(ev.get("item_id") or "").strip()
+                doc_id = str(ev.get("doc_id") or "").strip()
+                if item_id:
+                    unique_items.add(item_id)
+                if doc_id:
+                    unique_docs.add(doc_id)
+
+            visual_ids = (
+                [str(x).strip() for x in bullet_visual_ids[bullet_idx] if str(x).strip()]
+                if bullet_idx < len(bullet_visual_ids) and isinstance(bullet_visual_ids[bullet_idx], list)
+                else []
+            )
+            bullets_out.append(
+                {
+                    "text": bullet_text,
+                    "evidence_items": evidence_items,
+                    "visual_asset_ids": visual_ids,
+                }
+            )
+
+        visuals_out: List[Dict[str, Any]] = []
+        for visual in visuals_raw:
+            asset_id = str(visual.get("asset_id") or "").strip()
+            doc_id = str(visual.get("doc_id") or "").strip()
+            render_path = str(visual.get("render_path") or "").strip()
+            exists = _render_path_exists(visual)
+            if asset_id:
+                unique_assets.add(asset_id)
+            if doc_id:
+                unique_docs.add(doc_id)
+            if not exists and asset_id:
+                missing_assets.append(asset_id)
+            visuals_out.append(
+                {
+                    "asset_id": asset_id or None,
+                    "type": str(visual.get("asset_type") or "").strip() or None,
+                    "doc_id": doc_id or None,
+                    "locator": visual.get("locator") if isinstance(visual.get("locator"), dict) else {},
+                    "render_path": render_path or None,
+                    "specialty": str(visual.get("specialty") or "").strip() or None,
+                    "exists": exists,
+                }
+            )
+
+        slides_out.append(
+            {
+                "slide_index": idx,
+                "title": title,
+                "bullets": bullets_out,
+                "visual_role": str(slide.get("visual_role") or "").strip() or "illustrative",
+                "visuals": visuals_out,
+            }
+        )
+
+    unique_missing_assets = sorted(set(missing_assets))
+    return {
+        "deck_id": deck_id,
+        "deck_path": str(deck_path),
+        "request": _extract_request_for_audit(slide_plan),
+        "slides": slides_out,
+        "summary": {
+            "unique_docs": sorted(unique_docs),
+            "unique_items": sorted(unique_items),
+            "unique_assets": sorted(unique_assets),
+            "missing_asset_count": len(unique_missing_assets),
+            "missing_assets": unique_missing_assets,
+            "gates_applied": {
+                "s2_bullet_source_required": True,
+                "s2_structured_sources_embedded": True,
+                "s5_visual_grounding": True,
+                "s5_numeric_visual_link_enforced": _env_flag("SLIDES_ENFORCE_NUMERIC_VISUAL_LINK"),
+            },
+        },
+    }
+
+
+def _resolve_table_json_bytes(visual: Dict[str, Any]) -> Optional[bytes]:
+    files = visual.get("files") if isinstance(visual.get("files"), dict) else {}
+    local_table_path = str(files.get("table_local_path") or "").strip()
+    if local_table_path and Path(local_table_path).exists():
+        try:
+            return Path(local_table_path).read_bytes()
+        except Exception:
+            pass
+    table_uri = str(files.get("table_uri") or "").strip()
+    if table_uri:
+        try:
+            return _gs_read_bytes(table_uri)
+        except Exception:
+            return None
+    return None
+
+
+def _write_evidence_bundle(
+    *,
+    bundle_path: Path,
+    audit_payload: Dict[str, Any],
+    slide_plan: Dict[str, Any],
+) -> Path:
+    slides_raw = slide_plan.get("slides")
+    if not isinstance(slides_raw, list):
+        slides_raw = []
+    visuals_by_asset: Dict[str, Dict[str, Any]] = {}
+    for raw_slide in slides_raw:
+        slide = raw_slide if isinstance(raw_slide, dict) else {}
+        visuals_raw = slide.get("visuals")
+        if not isinstance(visuals_raw, list):
+            continue
+        for visual in visuals_raw:
+            if not isinstance(visual, dict):
+                continue
+            asset_id = str(visual.get("asset_id") or "").strip()
+            if not asset_id or asset_id in visuals_by_asset:
+                continue
+            visuals_by_asset[asset_id] = visual
+
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        def _writestr(name: str, payload: bytes) -> None:
+            info = zipfile.ZipInfo(name)
+            info.date_time = (1980, 1, 1, 0, 0, 0)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, payload)
+
+        _writestr("audit.json", _json_dumps_deterministic(audit_payload).encode("utf-8"))
+
+        for asset_id in sorted(visuals_by_asset.keys()):
+            visual = visuals_by_asset[asset_id]
+            render_path = str(visual.get("render_path") or "").strip()
+            if render_path and Path(render_path).exists():
+                ext = Path(render_path).suffix.lower() or ".png"
+                _writestr(f"assets/{asset_id}{ext}", Path(render_path).read_bytes())
+            if str(visual.get("asset_type") or "").strip().lower() == "table":
+                table_bytes = _resolve_table_json_bytes(visual)
+                if table_bytes:
+                    _writestr(f"tables/{asset_id}.json", table_bytes)
+    return bundle_path
+
+
 def _extract_slide_bullets(raw_slide: Dict[str, Any]) -> List[str]:
     bullets_raw = raw_slide.get("bullets")
     out: List[str] = []
@@ -953,14 +1394,18 @@ def _validate_slides_grounding(
 ) -> None:
     errors: List[str] = []
     source_doc_ids: set[str] = set()
+    enforce_numeric_visual_link = str(os.environ.get("SLIDES_ENFORCE_NUMERIC_VISUAL_LINK", "")).strip() == "1"
 
     for slide in slides:
         if len(slide.visuals) > 2:
             errors.append(f"slide {slide.slide_no}: more than 2 visuals")
+        visual_by_id: Dict[str, Dict[str, Any]] = {}
         for v in slide.visuals:
             aid = str(v.get("asset_id") or "").strip()
             if not aid:
                 errors.append(f"slide {slide.slide_no}: visual without asset_id")
+                continue
+            visual_by_id[aid] = v
             rpath = str(v.get("render_path") or "").strip()
             if not rpath:
                 errors.append(f"slide {slide.slide_no}: visual {aid or '<missing>'} missing render_path")
@@ -988,9 +1433,80 @@ def _validate_slides_grounding(
                 f"({len(slide.bullet_source_item_ids)} vs {len(slide.bullets)})"
             )
             continue
+        if len(slide.bullet_sources_structured) != len(slide.bullets):
+            errors.append(
+                f"slide {slide.slide_no}: bullet/structured-source cardinality mismatch "
+                f"({len(slide.bullet_sources_structured)} vs {len(slide.bullets)})"
+            )
+            continue
+        if len(slide.bullet_visual_asset_ids) != len(slide.bullets):
+            errors.append(
+                f"slide {slide.slide_no}: bullet/visual cardinality mismatch "
+                f"({len(slide.bullet_visual_asset_ids)} vs {len(slide.bullets)})"
+            )
+            continue
         for i, item_ids in enumerate(slide.bullet_source_item_ids, start=1):
             if not item_ids:
                 errors.append(f"slide {slide.slide_no} bullet {i}: empty source item_ids")
+        for i, structured_items in enumerate(slide.bullet_sources_structured, start=1):
+            if not structured_items:
+                errors.append(f"slide {slide.slide_no} bullet {i}: empty structured evidence")
+                continue
+            for evidence in structured_items:
+                if not isinstance(evidence, dict):
+                    errors.append(f"slide {slide.slide_no} bullet {i}: structured evidence must be object")
+                    continue
+                if not str(evidence.get("item_id") or "").strip():
+                    errors.append(f"slide {slide.slide_no} bullet {i}: structured evidence missing item_id")
+                if not str(evidence.get("doc_id") or "").strip():
+                    errors.append(f"slide {slide.slide_no} bullet {i}: structured evidence missing doc_id")
+                locator = evidence.get("locator")
+                if not isinstance(locator, dict):
+                    errors.append(f"slide {slide.slide_no} bullet {i}: structured evidence missing locator")
+        any_bullet_visual_link = False
+        has_table_visual = any(
+            str(v.get("asset_type") or "").strip().lower() == "table" for v in slide.visuals
+        )
+        for i, visual_ids in enumerate(slide.bullet_visual_asset_ids, start=1):
+            numeric_bullet = _bullet_has_numeric_intent(slide.bullets[i - 1])
+            if not isinstance(visual_ids, list):
+                errors.append(f"slide {slide.slide_no} bullet {i}: visual links must be a list")
+                continue
+            clean_ids: List[str] = []
+            for raw_id in visual_ids:
+                aid = str(raw_id or "").strip()
+                if not aid:
+                    continue
+                if aid not in visual_by_id:
+                    errors.append(
+                        f"slide {slide.slide_no} bullet {i}: linked visual {aid} not present on slide"
+                    )
+                    continue
+                v = visual_by_id.get(aid, {})
+                v_specialty = str(v.get("specialty") or "").strip().lower()
+                req_specialty = (requested_specialty or "").strip().lower()
+                if req_specialty and v_specialty and v_specialty != req_specialty:
+                    errors.append(
+                        f"slide {slide.slide_no} bullet {i}: linked visual {aid} specialty mismatch "
+                        f"({v_specialty} != {req_specialty})"
+                    )
+                    continue
+                if aid not in clean_ids:
+                    clean_ids.append(aid)
+            if clean_ids:
+                any_bullet_visual_link = True
+            if enforce_numeric_visual_link and numeric_bullet and not clean_ids and has_table_visual:
+                errors.append(
+                    f"slide {slide.slide_no} bullet {i}: numeric claim without linked visual evidence"
+                )
+
+        role = str(slide.visual_role or "").strip().lower()
+        if role not in {"evidence", "illustrative"}:
+            errors.append(f"slide {slide.slide_no}: invalid visual_role '{slide.visual_role}'")
+        if slide.visuals and role != "illustrative" and not any_bullet_visual_link:
+            errors.append(
+                f"slide {slide.slide_no}: visuals present but no bullet visual links (set visual_role=illustrative or link evidence)"
+            )
         for src in slide.sources:
             if src.doc_id:
                 source_doc_ids.add(src.doc_id)
@@ -1438,6 +1954,10 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
 
         source_item_ids = _unique_item_ids(sources)
         bullet_source_item_ids = [list(source_item_ids) for _ in bullets]
+        bullet_sources_structured = _build_bullet_sources_structured(
+            bullet_source_item_ids,
+            sources,
+        )
 
         visuals_raw = slide.get("visuals", [])
         chosen_visual_ids: List[str] = []
@@ -1494,6 +2014,9 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
                 title=title,
                 bullets=bullets,
                 bullet_source_item_ids=bullet_source_item_ids,
+                bullet_sources_structured=bullet_sources_structured,
+                bullet_visual_asset_ids=_compute_bullet_visual_asset_ids(bullets, visuals),
+                visual_role=_infer_visual_role(title, bullets, visuals),
                 visuals=visuals,
                 speaker_notes=(str(slide.get("speaker_notes")).strip() if slide.get("speaker_notes") is not None else None),
                 citations=citations,
@@ -1522,8 +2045,21 @@ def rag_slides_plan(req: RagSlidesPlanRequest) -> RagSlidesPlanResponse:
     if not slides:
         raise HTTPException(status_code=500, detail="Slides plan JSON invalid: produced 0 slides")
 
+    request_payload = {
+        "mode": "outline" if req.outline is not None else "query",
+        "query": query_text or None,
+        "outline_title": outline_used.title if outline_used else None,
+        "version": req.version,
+        "specialty": req.specialty,
+        "top_k": req.top_k,
+        "max_sections": req.max_sections,
+        "slides_per_section": req.slides_per_section,
+        "max_slides": req.max_slides,
+    }
+
     return RagSlidesPlanResponse(
         slides=slides,
+        request=request_payload,
         outline_used=outline_used if req.outline is None else None,
         retrieved=retrieved if req.include_retrieved else None,
     )
@@ -1547,6 +2083,20 @@ def rag_slides_pptx(req: RagSlidesPptxRequest, download: int = 0) -> RagSlidesPp
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PPTX build failed: {e}") from e
 
+    deck_id = out_path.stem
+    audit_payload = _build_deck_audit_manifest(req.slide_plan, deck_id=deck_id, deck_path=out_path)
+    audit_path = out_path.with_suffix(".audit.json")
+    audit_path.write_text(_json_dumps_deterministic(audit_payload), encoding="utf-8")
+
+    export_bundle = bool(req.evidence_bundle or _env_flag("PPTX_EXPORT_EVIDENCE_BUNDLE"))
+    bundle_path: Optional[Path] = None
+    if export_bundle:
+        bundle_path = _write_evidence_bundle(
+            bundle_path=out_path.with_suffix(".evidence.zip"),
+            audit_payload=audit_payload,
+            slide_plan=req.slide_plan,
+        )
+
     if download == 1:
         return FileResponse(
             path=str(out_path),
@@ -1558,4 +2108,6 @@ def rag_slides_pptx(req: RagSlidesPptxRequest, download: int = 0) -> RagSlidesPp
         path=str(out_path),
         filename=out_path.name,
         size_bytes=out_path.stat().st_size,
+        audit_path=str(audit_path),
+        evidence_bundle_path=str(bundle_path) if bundle_path else None,
     )
