@@ -986,3 +986,452 @@ Files updated in this step
 - Updated: `scripts/dev_docai_layout_ingest.py`
 - Updated: `src/odonto_rag/deck/pptx_builder.py`
 - Updated: `docs/master.md`
+
+# UPDATE LOG — v0.23 (APPEND-ONLY)
+Date: 2026-02-18 (Europe/Rome)
+
+## STEP S5 — Visual Claim Grounding (bullet → visual linkage) + audit gate
+Status: ✅ IMPLEMENTED
+
+To be implemented
+- [x] Schema (slide plan):
+  - add `bullet_visual_asset_ids: List[List[str]]` with bullet-level cardinality.
+  - add slide-level `visual_role: evidence | illustrative`.
+- [x] Planner deterministic assignment:
+  - bullet→visual links only from already selected visual candidates.
+  - numeric/quant bullets prefer table linking.
+  - lexical match on bullet text vs visual caption/locator/table headers.
+  - stable tie-break via `asset_id` ordering.
+- [x] Rendering audit trace:
+  - speaker notes include `BULLET_n evidence_items=[...] visuals=[...]`.
+- [x] Smoke gate S5:
+  - validate bullet/visual cardinality.
+  - validate linked visual ids exist on slide.
+  - validate specialty-safe linked visuals.
+  - if slide has visuals: require at least one linked bullet unless `visual_role=illustrative`.
+
+Implemented
+- [x] Added new slide-plan fields in API model:
+  - `bullet_visual_asset_ids` (default deterministic list per bullet)
+  - `visual_role` (defaulted by deterministic inference).
+- [x] Implemented deterministic visual-claim matcher in planner:
+  - no creative linking outside chosen slide visuals.
+  - numeric claim heuristic links to tables first.
+  - token overlap matcher uses captions + locator hints + table headers.
+  - deterministic ordering by `asset_id`.
+- [x] Implemented `visual_role` deterministic policy:
+  - any table on slide ⇒ `evidence`.
+  - figure-only slides default `illustrative`, upgraded to `evidence` with result/outcome caption cues.
+- [x] Extended slide grounding validation:
+  - bullet/source and bullet/visual cardinality checks.
+  - linked visual existence + specialty checks.
+  - visual-role gate (`evidence` requires at least one bullet→visual link).
+  - optional strict gate via env flag `SLIDES_ENFORCE_NUMERIC_VISUAL_LINK=1`.
+- [x] Added speaker-notes audit lines in PPTX builder:
+  - `Bullet grounding:`
+  - `BULLET_n evidence_items=[...] visuals=[...]`.
+
+Files updated in this step
+- Updated: `src/odonto_rag/api/rag_app.py`
+- Updated: `src/odonto_rag/deck/pptx_builder.py`
+- Updated: `docs/master.md`
+
+# UPDATE LOG — v0.24 (APPEND-ONLY)
+Date: 2026-02-18 (Europe/Rome)
+
+## S5 Operational Decision — Keynote profile
+Status: ✅ IMPLEMENTED
+
+Decision
+- Default delivery profile for S5 is now **Keynote hybrid**:
+  - `PPTX_KEYNOTE_SAFE=1`
+  - `PPTX_KEYNOTE_KEEP_TABLES=1`
+
+Why this profile
+- Keeps Keynote-safe package behavior (no notes slides emitted).
+- Preserves native PPTX tables for better editability/review workflow.
+- Avoids visual-evidence degradation from forced picture-only table fallback.
+
+Validated outputs
+- Preferred final deck:
+  - `out/decks/implantology_main_10slides_s5_keynote_hybrid_regen.pptx`
+- Alternative (safe non-hybrid, picture-based visuals):
+  - `out/decks/implantology_main_10slides_s5_keynote_safe_regen.pptx`
+
+Files updated in this step
+- Updated: `docs/master.md`
+
+# UPDATE LOG — v0.25 (APPEND-ONLY)
+Date: 2026-02-18 (Europe/Rome)
+
+## STEP S6 — Audit Pack & Deterministic Evidence Export (deck → JSON → assets)
+Status: ✅ IMPLEMENTED
+
+What was implemented
+- Deterministic audit manifest export on PPTX build:
+  - Endpoint `POST /rag/slides/pptx` now writes:
+    - `out/decks/<deck_id>.audit.json`
+  - Manifest includes:
+    - request metadata (`mode`, `query/outline`, `version`, `specialty`, timestamp, env profile),
+    - per-slide bullet evidence mapping (`item_id + doc_id + locator + score`),
+    - per-slide visuals (`asset_id`, `type`, `doc_id`, `locator`, `render_path`, `exists`, `visual_role`),
+    - summary (`unique_docs/items/assets`, `missing_asset_count`, applied S2/S5 gates).
+
+- S2.1 closure (structured sources embedded per bullet):
+  - Added `bullet_sources_structured` to slide plan schema.
+  - Planner now expands every bullet evidence item directly with `doc_id + locator (+score)`.
+  - Grounding validator now enforces cardinality and presence of structured evidence fields.
+
+- Optional evidence bundle export:
+  - `POST /rag/slides/pptx` accepts `evidence_bundle: true`
+    (or env `PPTX_EXPORT_EVIDENCE_BUNDLE=1`).
+  - Writes deterministic zip:
+    - `out/decks/<deck_id>.evidence.zip`
+  - Bundle content:
+    - `audit.json`
+    - `assets/<asset_id>.<ext>` for used visuals with local render path
+    - `tables/<asset_id>.json` when table payload is available.
+
+- S6 smoke gate script:
+  - New script: `scripts/check_slides_audit_pack.py`
+  - Validates:
+    - audit file exists and is valid JSON,
+    - every bullet has at least one evidence item with `item_id/doc_id/locator`,
+    - linked visuals have valid object structure and specialty coherence (when provided),
+    - `summary.missing_asset_count` consistency and policy gate (`--allow-missing-assets`).
+
+Files updated in this step
+- Updated: `src/odonto_rag/api/rag_app.py`
+- Added: `scripts/check_slides_audit_pack.py`
+- Updated: `docs/master.md`
+
+# UPDATE LOG — v0.26 (APPEND-ONLY)
+Date: 2026-02-18 (Europe/Rome)
+
+## STEP S6.1 — One-shot smoke runner (plan → pptx → audit)
+Status: ✅ IMPLEMENTED
+
+What was implemented
+- Added a single local smoke runner script to execute the full verification chain:
+  1) optional S5 plan grounding check
+  2) PPTX generation via `POST /rag/slides/pptx`
+  3) S6 audit-pack validation on generated `*.audit.json`
+- Script auto-infers specialty from `plan.request.specialty` when available.
+- Supports evidence bundle requests and missing-asset policy override.
+
+New script
+- Added: `scripts/run_slides_audit_smoke.py`
+
+Usage example
+- `python3 scripts/run_slides_audit_smoke.py --plan-json /tmp/plan.json --api-base http://127.0.0.1:8000`
+- Optional:
+  - `--evidence-bundle`
+  - `--allow-missing-assets`
+  - `--specialty implantology`
+  - `--skip-plan-check`
+
+Files updated in this step
+- Added: `scripts/run_slides_audit_smoke.py`
+- Updated: `docs/master.md`
+
+# UPDATE LOG — v0.27 (APPEND-ONLY)
+Date: 2026-02-18 (Europe/Rome)
+
+## STEP S7 — Deterministic Regression Suite (golden plans + golden audit diffs)
+Status: ✅ IMPLEMENTED
+
+To be implemented
+- [x] S7.1 Golden fixtures (2 specialties):
+  - create `tests/fixtures/slides/implantology.plan.json`
+  - create `tests/fixtures/slides/endodontics.plan.json`
+  - fixture plans must be stable and used as renderer input (no Qdrant/LLM in tests)
+- [x] S7.2 Offline smoke runner mode (plan → pptx → audit):
+  - extend `scripts/run_slides_audit_smoke.py` with `--offline`
+  - in offline mode call local builder directly from plan JSON
+  - deterministic outputs:
+    - `out/tests/<name>/deck.pptx`
+    - `out/tests/<name>/deck.audit.json`
+- [x] S7.3 Golden audit diff (canonical + semantic):
+  - add `scripts/diff_audit_json.py old.audit.json new.audit.json`
+  - normalization rules:
+    - ignore volatile fields (`timestamp`, `run_id`)
+    - sort lists deterministically (slides, bullets, evidence items, visual assets)
+  - semantic diff signal:
+    - `bullet text changed`
+    - `evidence items changed`
+    - `visual links changed`
+    - `missing_asset_count changed`
+- [x] S7.4 Determinism gate (hash):
+  - normalized `SHA256` per fixture audit JSON
+  - fail when hash/diff changes without explicit golden update
+
+Implemented
+- [x] Added deterministic fixture plans:
+  - `tests/fixtures/slides/implantology.plan.json`
+  - `tests/fixtures/slides/endodontics.plan.json`
+- [x] Added offline build mode to smoke runner:
+  - updated `scripts/run_slides_audit_smoke.py`
+  - new args: `--offline`, `--out-root`, `--test-name`
+  - offline flow reuses local PPTX builder and local audit manifest generation.
+- [x] Added canonical/semantic audit diff tool:
+  - new `scripts/diff_audit_json.py`
+  - supports:
+    - semantic diff between old/new audits
+    - normalized SHA256 generation (`--sha256`)
+    - CI-friendly fail gate (`--fail-on-diff`)
+- [x] Added deterministic suite orchestrator:
+  - new `scripts/run_slides_regression_suite.py`
+  - runs fixtures offline, validates against golden audits, enforces hash gate
+  - supports `--update-golden` for intentional baseline refresh.
+- [x] Committed golden baselines:
+  - `tests/fixtures/slides/implantology.golden.audit.json`
+  - `tests/fixtures/slides/endodontics.golden.audit.json`
+  - `tests/fixtures/slides/golden_hashes.json`
+
+Validation snapshot
+- `python3 scripts/run_slides_regression_suite.py --update-golden` ✅
+- `python3 scripts/run_slides_regression_suite.py` ✅
+- `python3 scripts/diff_audit_json.py tests/fixtures/slides/implantology.golden.audit.json out/tests/implantology/deck.audit.json --fail-on-diff` ✅
+
+Files updated in this step
+- Added: `tests/fixtures/slides/implantology.plan.json`
+- Added: `tests/fixtures/slides/endodontics.plan.json`
+- Added: `tests/fixtures/slides/implantology.golden.audit.json`
+- Added: `tests/fixtures/slides/endodontics.golden.audit.json`
+- Added: `tests/fixtures/slides/golden_hashes.json`
+- Updated: `scripts/run_slides_audit_smoke.py`
+- Added: `scripts/diff_audit_json.py`
+- Added: `scripts/run_slides_regression_suite.py`
+- Updated: `docs/master.md`
+
+# UPDATE LOG — v0.28 (APPEND-ONLY)
+Date: 2026-02-18 (Europe/Rome)
+
+## STEP S8 — Clinical Quality Eval Suite (rubric + metrics su audit.json)
+Status: ✅ IMPLEMENTED
+
+Implemented
+- [x] Added deterministic quality evaluator:
+  - new `scripts/eval_audit_quality.py`
+  - input: `*.audit.json`
+  - outputs:
+    - `out/tests/<name>/quality.json`
+    - `out/tests/<name>/quality.txt`
+- [x] Implemented deterministic metric groups:
+  - evidence density (`mean/min/max`, `% bullets with single evidence`)
+  - source diversity (`unique_docs` deck + per-slide, slide diversity warnings)
+  - locator quality (`complete locator %`, `page-only %`)
+  - visual coherence (`visual_role=evidence` link consistency, numeric bullet→table link rate)
+  - readability (bullets/slide distribution, long bullet risk, table density when rows/cols available)
+  - fallback rate (`pdf_fallback_connected_components` detection if present in visual payload/meta + missing assets)
+  - coverage (`query/outline token coverage`, low-overlap slide warnings)
+- [x] Added optional quality budget gates (CLI-tunable):
+  - hard:
+    - `--hard-min-evidence-per-bullet` (default `1`)
+    - missing assets hard gate via `--strict-missing-assets` or `--hard-max-missing-assets`
+  - warn:
+    - `--warn-max-single-evidence-ratio` (default `0.30`)
+    - `--warn-max-fallback-asset-ratio` (default `0.20`)
+    - readability/overload thresholds (`bullets cap`, `long bullets`, etc.)
+- [x] Added deterministic quality diff/hash utility:
+  - new `scripts/diff_quality_json.py`
+  - supports:
+    - semantic diff `old/new`
+    - normalized SHA256 (`--sha256`)
+    - CI fail mode (`--fail-on-diff`)
+- [x] Integrated quality eval in regression suite:
+  - updated `scripts/run_slides_regression_suite.py`
+  - now generates `quality.json` per fixture
+  - optional golden check via `--quality-golden`:
+    - compares against `tests/fixtures/slides/<name>.golden.quality.json`
+    - enforces `tests/fixtures/slides/golden_quality_hashes.json`
+  - `--update-golden --quality-golden` refreshes both quality golden JSON and hash baselines.
+- [x] Added quality golden baselines:
+  - `tests/fixtures/slides/implantology.golden.quality.json`
+  - `tests/fixtures/slides/endodontics.golden.quality.json`
+  - `tests/fixtures/slides/golden_quality_hashes.json`
+
+Validation snapshot
+- `python3 -m py_compile scripts/eval_audit_quality.py scripts/diff_quality_json.py scripts/run_slides_regression_suite.py` ✅
+- `python3 scripts/run_slides_regression_suite.py --update-golden --quality-golden` ✅
+- `python3 scripts/run_slides_regression_suite.py --quality-golden` ✅
+
+Files updated in this step
+- Added: `scripts/eval_audit_quality.py`
+- Added: `scripts/diff_quality_json.py`
+- Updated: `scripts/run_slides_regression_suite.py`
+- Added: `tests/fixtures/slides/implantology.golden.quality.json`
+- Added: `tests/fixtures/slides/endodontics.golden.quality.json`
+- Added: `tests/fixtures/slides/golden_quality_hashes.json`
+- Updated: `tests/fixtures/slides/implantology.golden.audit.json`
+- Updated: `tests/fixtures/slides/endodontics.golden.audit.json`
+- Updated: `tests/fixtures/slides/golden_hashes.json`
+- Updated: `docs/master.md`
+
+# UPDATE LOG — v0.29 (APPEND-ONLY)
+Date: 2026-02-18 (Europe/Rome)
+
+## STEP S8 follow-up — CI profile strict defaults (dev vs ci)
+Status: ✅ IMPLEMENTED
+
+Implemented
+- [x] Added execution profile in regression suite:
+  - updated `scripts/run_slides_regression_suite.py`
+  - new flag: `--profile {dev,ci}` (default: `dev`)
+- [x] `--profile ci` now auto-enables strict quality gate behavior:
+  - `quality_golden=True`
+  - `quality_fail_on_hard=True`
+  - `quality_strict_missing_assets=True`
+- [x] Kept `dev` behavior permissive by default (current local workflow unchanged unless flags are passed).
+- [x] Hardened quality golden diff/hash across profiles:
+  - updated `scripts/diff_quality_json.py`
+  - `thresholds` treated as non-semantic for normalization/hash
+  - rationale: CI/dev may use different gate thresholds but should diff on outcomes/metrics, not config knobs.
+- [x] Refreshed quality hash baselines after normalization change:
+  - updated `tests/fixtures/slides/golden_quality_hashes.json`
+
+Validation snapshot
+- `python3 -m py_compile scripts/diff_quality_json.py scripts/run_slides_regression_suite.py` ✅
+- `python3 scripts/run_slides_regression_suite.py --profile dev --quality-golden --update-golden` ✅
+- `python3 scripts/run_slides_regression_suite.py --profile dev --quality-golden` ✅
+- `python3 scripts/run_slides_regression_suite.py --profile ci` ✅
+
+Files updated in this step
+- Updated: `scripts/run_slides_regression_suite.py`
+- Updated: `scripts/diff_quality_json.py`
+- Updated: `tests/fixtures/slides/golden_quality_hashes.json`
+- Updated: `docs/master.md`
+
+# UPDATE LOG — v0.30 (APPEND-ONLY)
+Date: 2026-02-18 (Europe/Rome)
+
+## STEP S9 — Deterministic Auto-Repair Loop (plan repair) + CI-friendly deltas
+Status: ✅ IMPLEMENTED
+
+Implemented
+- [x] S9.1 Deterministic plan normalizer/repair:
+  - added `scripts/repair_slide_plan.py`
+  - input: `plan.json`
+  - outputs:
+    - `plan.repaired.json`
+    - `repairs.applied.json` (machine-readable list)
+  - deterministic rules implemented:
+    - readability:
+      - cap bullets per slide (`max_bullets_per_slide`, default `6`)
+      - split/truncate long bullets with deterministic policy + ellipsis
+    - visual coherence:
+      - for `visual_role=evidence` + no linked bullets:
+        - deterministic relinking (`numeric -> first table`, else keyword overlap, stable tie-break)
+        - optional downgrade to `illustrative` when no deterministic link exists
+    - hard-mode additions:
+      - evidence overload trim to top-N per score (stable tie-break)
+      - table density compact policy (`compact_mode`) when rows/cols/cells exceed thresholds
+- [x] S9.2 Hooked deterministic auto-repair in regression runner:
+  - updated `scripts/run_slides_regression_suite.py`
+  - new flag: `--auto-repair {off,soft,hard}` (default: `off`)
+  - flow with auto-repair enabled:
+    - run `before`: build + audit + quality eval
+    - if hard-fail or warning_count above threshold:
+      - repair plan deterministically
+      - run `after`: rebuild + re-eval
+      - persist artifacts in:
+        - `out/tests/<name>/before/`
+        - `out/tests/<name>/after/`
+      - produce CI-friendly deltas:
+        - `out/tests/<name>/after/audit.diff.txt`
+        - `out/tests/<name>/after/quality.diff.txt`
+        - `out/tests/<name>/after/repairs.applied.json`
+      - write consolidated report:
+        - `out/tests/<name>/auto_repair_report.json` (before/after gates + diff + repairs)
+- [x] S9.3 Explicit policy controls via env/flags:
+  - env-supported in `repair_slide_plan.py`:
+    - `SLIDES_REPAIR_MAX_BULLETS_PER_SLIDE`
+    - `SLIDES_REPAIR_MAX_EVIDENCE_PER_BULLET`
+    - `SLIDES_REPAIR_LONG_BULLET_CHARS`
+    - `SLIDES_REPAIR_DOWNGRADE_VISUAL_ROLE_ON_NO_LINK`
+  - CLI overrides:
+    - in `repair_slide_plan.py`:
+      - `--max-bullets-per-slide`
+      - `--max-evidence-per-bullet`
+      - `--long-bullet-chars`
+      - `--downgrade-visual-role-on-no-link`
+    - pass-through in regression suite:
+      - `--repair-max-bullets-per-slide`
+      - `--repair-max-evidence-per-bullet`
+      - `--repair-long-bullet-chars`
+      - `--repair-downgrade-visual-role-on-no-link`
+
+Validation snapshot
+- `python3 -m py_compile scripts/repair_slide_plan.py scripts/run_slides_regression_suite.py` ✅
+- `python3 scripts/run_slides_regression_suite.py --fixtures implantology` ✅
+- `python3 scripts/run_slides_regression_suite.py --fixtures implantology --auto-repair soft --auto-repair-warning-threshold 0 --quality-warn-long-bullet-chars 20 --quality-warn-max-long-bullets 0 --repair-long-bullet-chars 20` ✅ (auto-repair branch executed; expected strict-threshold failure due residual non-readability warnings, with full before/after deltas generated)
+
+Files updated in this step
+- Added: `scripts/repair_slide_plan.py`
+- Updated: `scripts/run_slides_regression_suite.py`
+- Updated: `docs/master.md`
+
+# UPDATE LOG — v0.31 (APPEND-ONLY)
+Date: 2026-02-18 (Europe/Rome)
+
+## STEP S10 — Audit Review UI (local, static) + click-to-evidence
+Status: ✅ IMPLEMENTED
+
+Implemented
+- [x] S10.1 Static HTML viewer (zero backend):
+  - Added `scripts/build_audit_viewer.py` to generate:
+    - `out/decks/<deck_id>.audit.html` (or custom output path)
+  - Viewer is built from normalized/stable audit ordering:
+    - slides sorted deterministically,
+    - evidence items sorted deterministically,
+    - visuals sorted deterministically.
+  - Viewer UI includes:
+    - slide list with warning badges,
+    - per-slide bullets + evidence list (`doc_id`, `locator`, `score`),
+    - visuals with thumbnail when local/bundled render is available,
+    - table JSON link (`tables/<asset_id>.json`) when evidence bundle is provided/extracted.
+
+- [x] S10.2 Evidence preview minimale:
+  - For evidence items with page locator, viewer exposes `Preview page` links.
+  - `build_audit_viewer.py` pre-generates/caches deterministic page PNGs under:
+    - `out/assets/pages/<doc_id>/<version>/pXXXX.png`
+  - Cache-first policy:
+    - reuse existing preview if present,
+    - otherwise render once from source PDF (via catalog `documents.gcs_raw_path`) and reuse.
+  - Visual crops are shown directly from `render_path` when available, with bundle fallback from extracted `assets/`.
+
+- [x] S10.3 Review outcomes (human-in-the-loop):
+  - Viewer supports per-bullet review fields:
+    - `status: ok | needs_edit | reject`
+    - `note`
+    - optional `suggested_rewrite`
+  - Added save/load flow in static UI:
+    - download JSON,
+    - file picker save (when browser supports File System Access API),
+    - load existing review JSON.
+  - `build_audit_viewer.py` also emits default review template:
+    - `out/decks/<deck_id>.review.json` (or custom path)
+    - with deterministic `slide_id` / `bullet_id`.
+
+- [x] S10.4 Optional gate “no unresolved review”:
+  - Added `scripts/check_review_complete.py`.
+  - Fails when:
+    - any review row has `status=reject`,
+    - high-risk bullets (numeric-like text + only 1 evidence item) have no review status.
+
+Usage
+- Build viewer:
+  - `python3 scripts/build_audit_viewer.py --audit-json out/decks/<deck_id>.audit.json --evidence-zip out/decks/<deck_id>.evidence.zip`
+- Run review-completion gate:
+  - `python3 scripts/check_review_complete.py --audit-json out/decks/<deck_id>.audit.json --review-json out/decks/<deck_id>.review.json`
+
+Validation snapshot
+- `python3 -m py_compile scripts/build_audit_viewer.py scripts/check_review_complete.py` ✅
+- Viewer generation on fixture audit ✅
+- Review gate failure path validated (missing high-risk review) ✅
+- Review gate pass path validated after status assignment ✅
+
+Files updated in this step
+- Added: `scripts/build_audit_viewer.py`
+- Added: `scripts/check_review_complete.py`
+- Updated: `docs/master.md`
