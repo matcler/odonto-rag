@@ -1,0 +1,109 @@
+{
+  "audit_path": "out/tests/endodontics/deck.audit.json",
+  "deck_id": "deck",
+  "request": {
+    "query": "endodontic irrigation and sealing",
+    "outline_title": null,
+    "specialty": "endodontics",
+    "version": "v1-docai",
+    "mode": "query",
+    "env_profile": {
+      "PPTX_KEYNOTE_KEEP_TABLES": false,
+      "PPTX_KEYNOTE_SAFE": false,
+      "SLIDES_ALLOW_MISSING_ASSET": false,
+      "SLIDES_ENFORCE_NUMERIC_VISUAL_LINK": false
+    }
+  },
+  "counts": {
+    "slides": 2,
+    "bullets": 4,
+    "evidence_items": 4,
+    "visual_assets": 0,
+    "fallback_visual_assets": 0,
+    "missing_asset_count_summary": 0,
+    "missing_asset_count_runtime": 0
+  },
+  "metrics": {
+    "evidence_density": {
+      "per_bullet_mean": 1,
+      "per_bullet_min": 1,
+      "per_bullet_max": 1,
+      "single_evidence_bullets_ratio": 1.0
+    },
+    "source_diversity": {
+      "unique_docs_deck": 1,
+      "unique_docs_per_slide": [
+        {
+          "slide_index": 1,
+          "doc_count": 1
+        },
+        {
+          "slide_index": 2,
+          "doc_count": 1
+        }
+      ]
+    },
+    "locator_quality": {
+      "with_page_ratio": 1.0,
+      "complete_locator_ratio": 0.0,
+      "page_only_locator_ratio": 1.0
+    },
+    "visual_coherence": {
+      "evidence_role_slides": 0,
+      "evidence_role_unlinked_slides": 0,
+      "evidence_role_unlinked_ratio": null,
+      "numeric_bullets": 0,
+      "numeric_bullets_linked_to_table": 0,
+      "numeric_table_link_ratio": null
+    },
+    "readability": {
+      "bullets_per_slide_mean": 2,
+      "bullets_per_slide_min": 2,
+      "bullets_per_slide_max": 2,
+      "slides_over_bullets_cap": 0,
+      "bullet_chars_mean": 62,
+      "bullet_chars_max": 65,
+      "bullet_tokens_mean": 6.75,
+      "bullet_tokens_max": 8,
+      "long_bullets": 0,
+      "table_shapes": [],
+      "dense_tables": 0
+    },
+    "fallback_rate": {
+      "fallback_assets_ratio": null,
+      "fallback_assets_count": 0,
+      "visual_assets_count": 0
+    },
+    "coverage": {
+      "query_token_coverage_ratio": 0.6666666666666666,
+      "outline_token_coverage_ratio": null,
+      "off_topic_slides": [],
+      "reference_token_count": 3
+    }
+  },
+  "thresholds": {
+    "hard_min_evidence_per_bullet": 1,
+    "hard_max_missing_assets": -1,
+    "warn_max_single_evidence_ratio": 0.3,
+    "warn_max_fallback_asset_ratio": 0.2,
+    "warn_max_page_only_locator_ratio": 0.7,
+    "warn_max_docs_per_slide": 3,
+    "warn_min_slide_query_overlap": 0.2,
+    "warn_bullets_per_slide_cap": 7,
+    "warn_max_slides_over_bullets_cap": 2,
+    "warn_long_bullet_chars": 140,
+    "warn_max_long_bullets": 2,
+    "warn_table_dense_cells": 60,
+    "warn_max_problematic_slides": 2
+  },
+  "warnings": [
+    "thin evidence risk: single-evidence bullets 100.0% > 30.0%",
+    "page-only locator ratio 100.0% > 70.0%"
+  ],
+  "gate": {
+    "hard_failures": [],
+    "warning_count": 2,
+    "pass_hard": true,
+    "pass_with_warnings": false
+  }
+}
