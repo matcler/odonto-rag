@@ -1,0 +1,133 @@
+{
+  "title": "Endodontics Golden Deck",
+  "request": {
+    "mode": "query",
+    "query": "endodontic irrigation and sealing",
+    "version": "v1-docai",
+    "specialty": "endodontics"
+  },
+  "slides": [
+    {
+      "slide_no": 1,
+      "title": "Irrigation Core Principles",
+      "bullets": [
+        "Irrigant activation improves debris removal in complex anatomies.",
+        "Contact time and concentration impact antimicrobial effect."
+      ],
+      "bullet_source_item_ids": [
+        ["endo-item-001"],
+        ["endo-item-002"]
+      ],
+      "bullet_sources_structured": [
+        [
+          {
+            "item_id": "endo-item-001",
+            "doc_id": "endodontics-golden-doc",
+            "locator": {
+              "page_start": 2,
+              "page_end": 2
+            },
+            "score": 0.92
+          }
+        ],
+        [
+          {
+            "item_id": "endo-item-002",
+            "doc_id": "endodontics-golden-doc",
+            "locator": {
+              "page_start": 5,
+              "page_end": 5
+            },
+            "score": 0.9
+          }
+        ]
+      ],
+      "bullet_visual_asset_ids": [
+        [],
+        []
+      ],
+      "visual_role": "illustrative",
+      "visuals": [],
+      "citations": ["S1", "S2"],
+      "sources": [
+        {
+          "ref_id": "S1",
+          "item_id": "endo-item-001",
+          "page_start": 2,
+          "page_end": 2,
+          "score": 0.92,
+          "doc_id": "endodontics-golden-doc"
+        },
+        {
+          "ref_id": "S2",
+          "item_id": "endo-item-002",
+          "page_start": 5,
+          "page_end": 5,
+          "score": 0.9,
+          "doc_id": "endodontics-golden-doc"
+        }
+      ]
+    },
+    {
+      "slide_no": 2,
+      "title": "Obturation Determinants",
+      "bullets": [
+        "Apical sealing quality depends on cone fit and taper control.",
+        "Thermoplastic techniques can improve adaptation in oval canals."
+      ],
+      "bullet_source_item_ids": [
+        ["endo-item-003"],
+        ["endo-item-004"]
+      ],
+      "bullet_sources_structured": [
+        [
+          {
+            "item_id": "endo-item-003",
+            "doc_id": "endodontics-golden-doc",
+            "locator": {
+              "page_start": 9,
+              "page_end": 9
+            },
+            "score": 0.88
+          }
+        ],
+        [
+          {
+            "item_id": "endo-item-004",
+            "doc_id": "endodontics-golden-doc",
+            "locator": {
+              "page_start": 10,
+              "page_end": 10
+            },
+            "score": 0.86
+          }
+        ]
+      ],
+      "bullet_visual_asset_ids": [
+        [],
+        []
+      ],
+      "visual_role": "illustrative",
+      "visuals": [],
+      "citations": ["S3", "S4"],
+      "sources": [
+        {
+          "ref_id": "S3",
+          "item_id": "endo-item-003",
+          "page_start": 9,
+          "page_end": 9,
+          "score": 0.88,
+          "doc_id": "endodontics-golden-doc"
+        },
+        {
+          "ref_id": "S4",
+          "item_id": "endo-item-004",
+          "page_start": 10,
+          "page_end": 10,
+          "score": 0.86,
+          "doc_id": "endodontics-golden-doc"
+        }
+      ]
+    }
+  ]
+}
