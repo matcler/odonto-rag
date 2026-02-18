@@ -15,16 +15,23 @@ from pptx.enum.text import PP_ALIGN
 from pptx.dml.color import RGBColor
 from pptx.util import Inches, Pt
 
-_KEYNOTE_SAFE = str(os.environ.get("PPTX_KEYNOTE_SAFE") or "").strip().lower() in {"1", "true", "yes", "on"}
-_KEYNOTE_KEEP_TABLES = str(os.environ.get("PPTX_KEYNOTE_KEEP_TABLES") or "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-_ELLIPSIS = "..." if _KEYNOTE_SAFE else "…"
+_TRUE_VALUES = {"1", "true", "yes", "on"}
 
-FONT_NAME = "Arial" if _KEYNOTE_SAFE else "Calibri"
+
+def _is_keynote_safe() -> bool:
+    return str(os.environ.get("PPTX_KEYNOTE_SAFE") or "").strip().lower() in _TRUE_VALUES
+
+
+def _is_keynote_keep_tables() -> bool:
+    return str(os.environ.get("PPTX_KEYNOTE_KEEP_TABLES") or "").strip().lower() in _TRUE_VALUES
+
+
+def _ellipsis() -> str:
+    return "..." if _is_keynote_safe() else "…"
+
+
+def _font_name() -> str:
+    return "Arial" if _is_keynote_safe() else "Calibri"
 TITLE_FONT_SIZE_PT = 32
 BODY_FONT_SIZE_PT = 20
 FOOTER_FONT_SIZE_PT = 8
@@ -52,14 +59,16 @@ def _truncate_footer_label(text: str, limit: int = 200) -> str:
     value = (text or "").strip()
     if len(value) <= limit:
         return value
-    return value[: max(0, limit - len(_ELLIPSIS))].rstrip() + _ELLIPSIS
+    ellipsis = _ellipsis()
+    return value[: max(0, limit - len(ellipsis))].rstrip() + ellipsis
 
 
 def _truncate_text(text: str, limit: int) -> str:
     value = (text or "").strip()
     if len(value) <= limit:
         return value
-    return value[: max(0, limit - len(_ELLIPSIS))].rstrip() + _ELLIPSIS
+    ellipsis = _ellipsis()
+    return value[: max(0, limit - len(ellipsis))].rstrip() + ellipsis
 
 
 def _read_uri_bytes(uri: str) -> bytes:
@@ -407,13 +416,13 @@ def _add_table_visual(
             cell.margin_bottom = Pt(2)
             for p in tf.paragraphs:
                 for run in p.runs:
-                    run.font.name = FONT_NAME
+                    run.font.name = _font_name()
                     run.font.size = Pt(10 if r == 0 else body_font_size)
                     run.font.bold = bool(r == 0 or c == 0)
             if r == 0:
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = RGBColor(242, 242, 242)
-    if not _KEYNOTE_SAFE:
+    if not _is_keynote_safe():
         for span in normalized_spans:
             try:
                 row = span["row"]
@@ -513,6 +522,18 @@ def build_pptx_from_slide_plan(
         citations = [str(c).strip() for c in citations_raw if str(c).strip()] if isinstance(citations_raw, list) else []
         sources_raw = slide_data.get("sources")
         sources = [s for s in sources_raw if isinstance(s, dict)] if isinstance(sources_raw, list) else []
+        bullet_source_raw = slide_data.get("bullet_source_item_ids")
+        bullet_source_item_ids = (
+            [x if isinstance(x, list) else [] for x in bullet_source_raw]
+            if isinstance(bullet_source_raw, list)
+            else []
+        )
+        bullet_visual_raw = slide_data.get("bullet_visual_asset_ids")
+        bullet_visual_asset_ids = (
+            [x if isinstance(x, list) else [] for x in bullet_visual_raw]
+            if isinstance(bullet_visual_raw, list)
+            else []
+        )
         visuals_raw = slide_data.get("visuals")
         visuals = [v for v in visuals_raw if isinstance(v, dict)] if isinstance(visuals_raw, list) else []
 
@@ -526,7 +547,7 @@ def build_pptx_from_slide_plan(
         for p in title_shape.text_frame.paragraphs:
             p.alignment = PP_ALIGN.LEFT
             for run in p.runs:
-                run.font.name = FONT_NAME
+                run.font.name = _font_name()
                 run.font.size = Pt(TITLE_FONT_SIZE_PT)
 
         body_shape = slide.placeholders[1]
@@ -548,7 +569,7 @@ def build_pptx_from_slide_plan(
             paragraph.level = 0
             paragraph.space_after = Pt(6)
             for run in paragraph.runs:
-                run.font.name = FONT_NAME
+                run.font.name = _font_name()
                 run.font.size = Pt(BODY_FONT_SIZE_PT)
 
         visual_notes: list[str] = []
@@ -570,7 +591,7 @@ def build_pptx_from_slide_plan(
                     visual_notes.append(f"MISSING_ASSET asset_id={v.get('asset_id')}")
                 locator_text = _visual_locator_text(v)
                 v_type = str(v.get("asset_type") or "").strip().lower()
-                if not _KEYNOTE_SAFE:
+                if not _is_keynote_safe():
                     if v_type == "table":
                         visual_notes.append(
                             f"TABLE_{v_i} asset_id={v.get('asset_id')} doc_id={v.get('doc_id')} locator={locator_text}"
@@ -589,14 +610,14 @@ def build_pptx_from_slide_plan(
                 img_left, img_top, img_w, img_h = Inches(0.9), Inches(3.15), Inches(11.5), Inches(2.15)
                 rows = v.get("_table_rows")
                 if isinstance(rows, list):
-                    if _KEYNOTE_SAFE and not _KEYNOTE_KEEP_TABLES and str(v.get("render_path") or "").strip() and Path(str(v["render_path"])).exists():
+                    if _is_keynote_safe() and not _is_keynote_keep_tables() and str(v.get("render_path") or "").strip() and Path(str(v["render_path"])).exists():
                         _add_picture_contain(slide, str(v["render_path"]), img_left, img_top, img_w, img_h)
                     else:
                         spans = v.get("_table_spans") if isinstance(v.get("_table_spans"), list) else []
                         rendered, reason = _add_table_visual(slide, rows, spans, img_left, img_top, img_w, img_h)
                         if not rendered and str(v.get("render_path") or "").strip() and Path(str(v["render_path"])).exists():
                             _add_picture_contain(slide, str(v["render_path"]), img_left, img_top, img_w, img_h)
-                            if not _KEYNOTE_SAFE:
+                            if not _is_keynote_safe():
                                 visual_notes.append(f"TABLE_RENDER_FALLBACK asset_id={v.get('asset_id')} reason={reason}")
                 else:
                     _add_picture_contain(slide, str(v["render_path"]), img_left, img_top, img_w, img_h)
@@ -607,7 +628,7 @@ def build_pptx_from_slide_plan(
                 cp = cap_tf.paragraphs[0]
                 cp.text = _truncate_text(cap, 180)
                 for run in cp.runs:
-                    run.font.name = FONT_NAME
+                    run.font.name = _font_name()
                     run.font.size = Pt(10)
             elif len(valid_visuals) >= 2:
                 slots = [
@@ -617,14 +638,14 @@ def build_pptx_from_slide_plan(
                 for v, slot in zip(valid_visuals[:2], slots):
                     rows = v.get("_table_rows")
                     if isinstance(rows, list):
-                        if _KEYNOTE_SAFE and not _KEYNOTE_KEEP_TABLES and str(v.get("render_path") or "").strip() and Path(str(v["render_path"])).exists():
+                        if _is_keynote_safe() and not _is_keynote_keep_tables() and str(v.get("render_path") or "").strip() and Path(str(v["render_path"])).exists():
                             _add_picture_contain(slide, str(v["render_path"]), *slot)
                         else:
                             spans = v.get("_table_spans") if isinstance(v.get("_table_spans"), list) else []
                             rendered, reason = _add_table_visual(slide, rows, spans, *slot)
                             if not rendered and str(v.get("render_path") or "").strip() and Path(str(v["render_path"])).exists():
                                 _add_picture_contain(slide, str(v["render_path"]), *slot)
-                                if not _KEYNOTE_SAFE:
+                                if not _is_keynote_safe():
                                     visual_notes.append(f"TABLE_RENDER_FALLBACK asset_id={v.get('asset_id')} reason={reason}")
                     else:
                         _add_picture_contain(slide, str(v["render_path"]), *slot)
@@ -635,7 +656,7 @@ def build_pptx_from_slide_plan(
                     cp = cap_tf.paragraphs[0]
                     cp.text = _truncate_text(cap, 90)
                     for run in cp.runs:
-                        run.font.name = FONT_NAME
+                        run.font.name = _font_name()
                         run.font.size = Pt(9)
 
         footer_lines: list[str] = []
@@ -683,12 +704,12 @@ def build_pptx_from_slide_plan(
             footer_frame = footer_box.text_frame
             footer_frame.clear()
             footer_frame.word_wrap = True
-            footer_frame.auto_size = MSO_AUTO_SIZE.NONE if _KEYNOTE_SAFE else MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+            footer_frame.auto_size = MSO_AUTO_SIZE.NONE if _is_keynote_safe() else MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
             footer_p = footer_frame.paragraphs[0]
             footer_p.text = "\n".join(footer_lines)
             footer_p.alignment = PP_ALIGN.LEFT
             for run in footer_p.runs:
-                run.font.name = FONT_NAME
+                run.font.name = _font_name()
                 run.font.size = Pt(FOOTER_FONT_SIZE_PT)
 
         notes_parts = []
@@ -724,7 +745,25 @@ def build_pptx_from_slide_plan(
                 source_lines.append(f"{label} ({c} {page_text})")
             notes_parts.append("\n".join(source_lines))
 
-        if not _KEYNOTE_SAFE:
+        if bullets:
+            bullet_trace_lines = ["Bullet grounding:"]
+            for i, _ in enumerate(bullets, start=1):
+                source_ids = (
+                    [str(x).strip() for x in bullet_source_item_ids[i - 1] if str(x).strip()]
+                    if i - 1 < len(bullet_source_item_ids)
+                    else []
+                )
+                visual_ids = (
+                    [str(x).strip() for x in bullet_visual_asset_ids[i - 1] if str(x).strip()]
+                    if i - 1 < len(bullet_visual_asset_ids)
+                    else []
+                )
+                bullet_trace_lines.append(
+                    f"BULLET_{i} evidence_items={source_ids} visuals={visual_ids}"
+                )
+            notes_parts.append("\n".join(bullet_trace_lines))
+
+        if not _is_keynote_safe():
             if notes_parts:
                 slide.notes_slide.notes_text_frame.text = "\n\n".join(notes_parts)
                 if visual_notes:
