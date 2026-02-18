@@ -1,0 +1,116 @@
+{
+  "deck_id": "deck",
+  "deck_path": "out/tests/endodontics/deck.pptx",
+  "request": {
+    "env_profile": {
+      "PPTX_KEYNOTE_KEEP_TABLES": false,
+      "PPTX_KEYNOTE_SAFE": false,
+      "SLIDES_ALLOW_MISSING_ASSET": false,
+      "SLIDES_ENFORCE_NUMERIC_VISUAL_LINK": false
+    },
+    "mode": "query",
+    "outline_title": null,
+    "query": "endodontic irrigation and sealing",
+    "specialty": "endodontics",
+    "timestamp": "2026-02-18T17:13:31Z",
+    "version": "v1-docai"
+  },
+  "slides": [
+    {
+      "bullets": [
+        {
+          "evidence_items": [
+            {
+              "doc_id": "endodontics-golden-doc",
+              "item_id": "endo-item-001",
+              "locator": {
+                "page_end": 2,
+                "page_start": 2
+              },
+              "score": 0.92
+            }
+          ],
+          "text": "Irrigant activation improves debris removal in complex anatomies.",
+          "visual_asset_ids": []
+        },
+        {
+          "evidence_items": [
+            {
+              "doc_id": "endodontics-golden-doc",
+              "item_id": "endo-item-002",
+              "locator": {
+                "page_end": 5,
+                "page_start": 5
+              },
+              "score": 0.9
+            }
+          ],
+          "text": "Contact time and concentration impact antimicrobial effect.",
+          "visual_asset_ids": []
+        }
+      ],
+      "slide_index": 1,
+      "title": "Irrigation Core Principles",
+      "visual_role": "illustrative",
+      "visuals": []
+    },
+    {
+      "bullets": [
+        {
+          "evidence_items": [
+            {
+              "doc_id": "endodontics-golden-doc",
+              "item_id": "endo-item-003",
+              "locator": {
+                "page_end": 9,
+                "page_start": 9
+              },
+              "score": 0.88
+            }
+          ],
+          "text": "Apical sealing quality depends on cone fit and taper control.",
+          "visual_asset_ids": []
+        },
+        {
+          "evidence_items": [
+            {
+              "doc_id": "endodontics-golden-doc",
+              "item_id": "endo-item-004",
+              "locator": {
+                "page_end": 10,
+                "page_start": 10
+              },
+              "score": 0.86
+            }
+          ],
+          "text": "Thermoplastic techniques can improve adaptation in oval canals.",
+          "visual_asset_ids": []
+        }
+      ],
+      "slide_index": 2,
+      "title": "Obturation Determinants",
+      "visual_role": "illustrative",
+      "visuals": []
+    }
+  ],
+  "summary": {
+    "gates_applied": {
+      "s2_bullet_source_required": true,
+      "s2_structured_sources_embedded": true,
+      "s5_numeric_visual_link_enforced": false,
+      "s5_visual_grounding": true
+    },
+    "missing_asset_count": 0,
+    "missing_assets": [],
+    "unique_assets": [],
+    "unique_docs": [
+      "endodontics-golden-doc"
+    ],
+    "unique_items": [
+      "endo-item-001",
+      "endo-item-002",
+      "endo-item-003",
+      "endo-item-004"
+    ]
+  }
+}
